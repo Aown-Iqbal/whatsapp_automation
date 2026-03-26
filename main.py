@@ -1,35 +1,21 @@
 """
-main.py — CSV-driven sequential WhatsApp outreach.
+main.py — WhatsApp outreach bot.
 
-CSV required columns:
-    name             Business name
-    owner_phone      WhatsApp JID  e.g. 923001234567@s.whatsapp.net
-    facebook         Facebook page URL
-    website          Website URL (can be empty)
-    running_ads      true / false  (or 1 / 0)
-    completion_score Integer 0-100
-
-Optional column (added automatically on first run):
-    status           pending | done | no_reply | error
+Usage:
+    python main.py [leads.csv] [--dry-run]
 """
 
-import csv
+import argparse
 import logging
-import os
+import sys
 import time
-from pathlib import Path
 
-import ai
+import config
+import state as state_store
 import whatsapp
-from config import (
-    CSV_PATH,
-    POLL_INTERVAL_SECONDS,
-    REPLY_TIMEOUT_SECONDS,
-    WAIT_AFTER_REPLY_SECONDS,
-)
-from prompt import build_system_prompt
+from ai import get_reply, contains_money_talk
+from leads import load_leads
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -38,226 +24,199 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── CSV helpers ───────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-def load_csv(path: str) -> tuple[list[dict], list[str]]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("csv", nargs="?", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+# ── Send helpers ──────────────────────────────────────────────────────────────
+
+def send(jid: str, text: str, dry_run: bool) -> None:
+    if dry_run:
+        logger.info("[DRY-RUN] → %s: %s", jid, text[:120])
+        return
+    whatsapp.send_message(jid, text)
+
+
+def notify_owner(jid: str, business_name: str, dry_run: bool) -> None:
+    send(config.NOTIFY_JID, f"[Money talk] {business_name} ({jid})", dry_run)
+
+
+# ── Opening / follow-up ───────────────────────────────────────────────────────
+
+OPENING_TRIGGER  = "Start the conversation now. Send the very first greeting message to the business owner."
+FOLLOWUP_TRIGGER = "The person hasn't replied in a while. Send a short, polite follow-up message."
+
+
+def send_opening(chat: state_store.ChatState, dry_run: bool) -> None:
+    logger.info("Opening → %s (%s)", chat.business["name"], chat.jid)
+    reply, updated_history = get_reply(chat.business, [], OPENING_TRIGGER)
+    send(chat.jid, reply, dry_run)
+    chat.history          = updated_history
+    chat.opening_sent     = True
+    chat.opening_sent_time = time.time()
+    state_store.save_one(chat)
+
+
+def send_followup(chat: state_store.ChatState, dry_run: bool) -> None:
+    logger.info("Follow-up → %s (%s)", chat.business["name"], chat.jid)
+    reply, updated_history = get_reply(chat.business, chat.history, FOLLOWUP_TRIGGER)
+    send(chat.jid, reply, dry_run)
+    chat.history       = updated_history
+    chat.followup_sent = True
+    state_store.save_one(chat)
+
+
+# ── Queue logic ───────────────────────────────────────────────────────────────
+
+def ready_to_move_on(chat: state_store.ChatState) -> bool:
     """
-    Load the CSV and return (rows, fieldnames).
-    Adds a 'status' column defaulting to 'pending' if it doesn't exist.
+    True when we should stop waiting on this lead and open the next one.
+
+    - They replied  → wait MOVE_ON_REPLIED_HOURS after their last message
+    - No reply yet  → wait MOVE_ON_NO_REPLY_HOURS after we sent the opening
     """
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames or [])
-        rows = list(reader)
-
-    if "status" not in fieldnames:
-        fieldnames.append("status")
-        for row in rows:
-            row.setdefault("status", "pending")
-
-    return rows, fieldnames
+    if chat.last_inbound_time is not None:
+        hours = (time.time() - chat.last_inbound_time) / 3600
+        return hours >= config.MOVE_ON_REPLIED_HOURS
+    else:
+        secs = state_store.seconds_since_opening(chat)
+        if secs is None:
+            return False
+        return (secs / 3600) >= config.MOVE_ON_NO_REPLY_HOURS
 
 
-def save_csv(path: str, rows: list[dict], fieldnames: list[str]) -> None:
-    """Write rows back to the CSV, preserving column order."""
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+# ── Inbound processing ────────────────────────────────────────────────────────
 
+def process_inbound(chat: state_store.ChatState, dry_run: bool) -> None:
+    try:
+        messages = whatsapp.get_messages(chat.jid)
+    except RuntimeError as exc:
+        logger.warning("Could not fetch messages for %s: %s", chat.jid, exc)
+        return
 
-def parse_business(row: dict) -> dict:
-    """Normalise a CSV row into the business dict expected by build_system_prompt."""
-    running_ads_raw = str(row.get("running_ads", "false")).strip().lower()
-    return {
-        "name":             row.get("name", "").strip(),
-        "owner_phone":      row.get("owner_phone", "").strip(),
-        "facebook":         row.get("facebook", "").strip(),
-        "website":          row.get("website", "").strip(),
-        "running_ads":      running_ads_raw in ("true", "1", "yes"),
-        "completion_score": int(row.get("completion_score", 0) or 0),
-    }
+    if not messages:
+        return
 
-
-# ── Message helpers ───────────────────────────────────────────────────────────
-
-def collect_their_messages(messages: list[dict], since_id: str | None) -> str:
-    """
-    Walk the message list (newest-first) and return all consecutive inbound
-    messages that arrived after since_id as one combined string.
-    """
-    new_parts: list[str] = []
+    new_messages = []
     for msg in messages:
-        if msg["MsgID"] == since_id:
+        if msg.get("id") == chat.last_seen_id:
             break
-        if msg["FromMe"]:
-            break
-        text = msg.get("Text") or msg.get("DisplayText") or ""
-        new_parts.append(text)
-    return " ".join(reversed(new_parts)).strip()
+        new_messages.append(msg)
+
+    if not new_messages:
+        return
+
+    chat.last_seen_id = messages[0].get("id")
+    inbound = [m for m in new_messages if not m.get("fromMe", True)]
+
+    if not inbound:
+        state_store.save_one(chat)
+        return
+
+    logger.info(
+        "%d inbound from %s — waiting %ds...",
+        len(inbound), chat.business["name"], config.WAIT_AFTER_REPLY_SECONDS,
+    )
+    if not dry_run:
+        time.sleep(config.WAIT_AFTER_REPLY_SECONDS)
+
+    latest_text = inbound[0].get("text") or inbound[0].get("body") or ""
+    chat.last_inbound_time = time.time()
+
+    if not chat.notified_money and contains_money_talk(latest_text):
+        logger.info("Money talk — %s", chat.business["name"])
+        notify_owner(chat.jid, chat.business["name"], dry_run)
+        chat.notified_money = True
+
+    reply, updated_history = get_reply(chat.business, chat.history, latest_text)
+    send(chat.jid, reply, dry_run)
+    chat.history = updated_history
+    state_store.save_one(chat)
 
 
-def send_and_record(jid: str, reply: str) -> None:
-    parts = whatsapp.send_message(jid, reply)
-    ai.add_assistant_messages(parts)
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
-
-# ── Single-contact conversation ───────────────────────────────────────────────
-
-def run_conversation(business: dict) -> str:
-    """
-    Conduct a full conversation with one contact.
-
-    Returns a status string:
-        'done'     — conversation ended naturally (inactivity timeout after at
-                     least one exchange)
-        'no_reply' — they never replied to the opening message
-        'error'    — an unrecoverable error occurred
-    """
-    jid = business["owner_phone"]
-    logger.info("━━━ Starting conversation with %s (%s) ━━━", business["name"], jid)
-
-    # Build a fresh prompt + history for this contact
-    system_prompt = build_system_prompt(business)
-    ai.new_conversation(system_prompt)
-
-    # ── Send opening ──────────────────────────────────────────────────────────
-    try:
-        opening = ai.get_reply("generate the opening message")
-        send_and_record(jid, opening)
-        logger.info("Opening sent.")
-    except RuntimeError as exc:
-        logger.error("Failed to send opening: %s", exc)
-        return "error"
-
-    # Snapshot the last message id right after we send
-    try:
-        messages = whatsapp.get_messages(jid)
-        last_seen_id: str | None = messages[0]["MsgID"] if messages else None
-    except RuntimeError as exc:
-        logger.error("Could not fetch initial messages: %s", exc)
-        return "error"
-
-    got_first_reply = False
-    idle_since = time.monotonic()   # reset every time we send something
-
-    # ── Poll loop for this contact ────────────────────────────────────────────
-    while True:
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-        # Check inactivity timeout
-        if time.monotonic() - idle_since > REPLY_TIMEOUT_SECONDS:
-            if got_first_reply:
-                logger.info(
-                    "No reply for %ds after last message, moving to next contact.",
-                    REPLY_TIMEOUT_SECONDS,
-                )
-                return "done"
-            else:
-                logger.info(
-                    "No reply to opening after %ds, marking as no_reply.",
-                    REPLY_TIMEOUT_SECONDS,
-                )
-                return "no_reply"
-
-        try:
-            messages = whatsapp.get_messages(jid)
-        except RuntimeError as exc:
-            logger.error("Failed to fetch messages: %s", exc)
-            continue
-
-        if not messages:
-            continue
-
-        latest = messages[0]
-
-        # Nothing new
-        if latest["FromMe"] or latest["MsgID"] == last_seen_id:
-            continue
-
-        # New inbound message — wait in case they're still typing
-        logger.info("New message detected, waiting %ds…", WAIT_AFTER_REPLY_SECONDS)
-        time.sleep(WAIT_AFTER_REPLY_SECONDS)
-
-        try:
-            messages = whatsapp.get_messages(jid)
-        except RuntimeError as exc:
-            logger.error("Failed to re-fetch messages: %s", exc)
-            continue
-
-        combined_text = collect_their_messages(messages, last_seen_id)
-        if not combined_text:
-            logger.warning("Could not extract text, skipping.")
-            continue
-
-        last_seen_id = messages[0]["MsgID"]
-        got_first_reply = True
-        logger.info("They said: %s", combined_text)
-
-        try:
-            reply = ai.get_reply(combined_text)
-        except RuntimeError as exc:
-            logger.error("AI call failed: %s", exc)
-            continue
-
-        try:
-            send_and_record(jid, reply)
-            idle_since = time.monotonic()   # reset timeout after every reply we send
-        except RuntimeError as exc:
-            logger.error("Failed to send reply: %s", exc)
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    csv_path = CSV_PATH
-
-    if not Path(csv_path).exists():
-        logger.error("CSV file not found: %s", csv_path)
-        raise SystemExit(1)
-
-    rows, fieldnames = load_csv(csv_path)
-    total   = len(rows)
-    pending = [r for r in rows if r.get("status", "pending") == "pending"]
-    logger.info("Loaded %d contacts, %d pending.", total, len(pending))
-
+def run(dry_run: bool = False) -> None:
     whatsapp.start_sync()
-    logger.info("wacli sync started.")
+    logger.info("wacli sync started")
 
-    for i, row in enumerate(rows):
-        if row.get("status", "pending") != "pending":
-            logger.info(
-                "Skipping %s (status=%s)", row.get("name", "?"), row.get("status")
-            )
-            continue
+    try:
+        while True:
+            all_chats = state_store.get_all()
 
-        business = parse_business(row)
+            # ── Advance the opening queue ─────────────────────────────────────
+            # Find the latest chat we've opened. If it's ready to move on,
+            # open the next one. Only one un-opened lead gets unlocked per cycle.
+            opened   = [c for c in all_chats if c.opening_sent]
+            unopened = [c for c in all_chats if not c.opening_sent]
 
-        if not business["owner_phone"]:
-            logger.warning("Row %d has no owner_phone, skipping.", i)
-            row["status"] = "error"
-            save_csv(csv_path, rows, fieldnames)
-            continue
+            if unopened:
+                # No openings sent yet — fire the first one immediately
+                if not opened:
+                    try:
+                        send_opening(unopened[0], dry_run)
+                    except Exception as exc:
+                        logger.error("Opening failed for %s: %s", unopened[0].jid, exc)
 
-        status = run_conversation(business)
-        row["status"] = status
-        save_csv(csv_path, rows, fieldnames)   # persist after every contact
+                # Last opened lead is ready to move on — open the next
+                elif ready_to_move_on(opened[-1]):
+                    logger.info(
+                        "%s is done — moving on to %s",
+                        opened[-1].business["name"], unopened[0].business["name"],
+                    )
+                    try:
+                        send_opening(unopened[0], dry_run)
+                    except Exception as exc:
+                        logger.error("Opening failed for %s: %s", unopened[0].jid, exc)
 
-        logger.info(
-            "Finished %s → status=%s  (%d/%d done)",
-            business["name"], status, i + 1, total,
-        )
+                else:
+                    # Log how long until we move on
+                    last = opened[-1]
+                    if last.last_inbound_time:
+                        remaining = config.MOVE_ON_REPLIED_HOURS * 3600 - (time.time() - last.last_inbound_time)
+                    else:
+                        remaining = config.MOVE_ON_NO_REPLY_HOURS * 3600 - (time.time() - (last.opening_sent_time or time.time()))
+                    logger.debug(
+                        "Waiting on %s — %.0fm until next opening",
+                        last.business["name"], remaining / 60,
+                    )
 
-    logger.info("All contacts processed.")
+            # ── Poll all opened chats for replies ─────────────────────────────
+            for chat in opened:
+                try:
+                    process_inbound(chat, dry_run)
+                except Exception as exc:
+                    logger.error("Inbound error for %s: %s", chat.jid, exc)
 
+            time.sleep(config.POLL_INTERVAL_SECONDS)
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted — shutting down")
+    finally:
+        whatsapp.stop_sync()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Interrupted — stopping sync.")
-        whatsapp.stop_sync()
-    except Exception:
-        logger.exception("Fatal error")
-        whatsapp.stop_sync()
-        raise
+    args = parse_args()
+
+    if args.csv:
+        config.LEADS_CSV = args.csv
+
+    if args.dry_run:
+        logger.info("DRY-RUN mode")
+
+    leads = load_leads()
+    if not leads:
+        logger.error("No leads found.")
+        sys.exit(1)
+
+    logger.info("Loaded %d lead(s)", len(leads))
+    state_store.load(leads)
+    run(dry_run=args.dry_run)

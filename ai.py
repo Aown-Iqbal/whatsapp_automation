@@ -1,61 +1,38 @@
+"""
+ai.py — Stateless AI calls. History is owned by ChatState, not here.
+"""
+
 import logging
 import time
 
 import requests
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, MAX_HISTORY
+from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, MAX_HISTORY, MONEY_KEYWORDS
+from prompt import build_system_prompt
 
 logger = logging.getLogger(__name__)
 
-_history: list[dict] = []
-_system_prompt: str = ""
 
+# ── Reply ─────────────────────────────────────────────────────────────────────
 
-# ── Session management ────────────────────────────────────────────────────────
-
-def new_conversation(system_prompt: str) -> None:
+def get_reply(
+    business: dict,
+    history: list[dict],
+    user_text: str,
+    retries: int = 3,
+    backoff: float = 5.0,
+) -> tuple[str, list[dict]]:
     """
-    Call this before starting each new contact.
-    Clears history and sets the system prompt for the conversation.
+    Append user_text to a COPY of history, call DeepSeek, return
+    (reply_text, updated_history). Caller is responsible for saving updated_history.
     """
-    global _history, _system_prompt
-    _history = []
-    _system_prompt = system_prompt
-    logger.debug("Conversation reset, new system prompt loaded.")
-
-
-# ── History helpers ───────────────────────────────────────────────────────────
-
-def add_user_message(text: str) -> None:
-    _history.append({"role": "user", "content": text})
-
-
-def add_assistant_messages(parts: list[str]) -> None:
-    for part in parts:
-        _history.append({"role": "assistant", "content": part})
-
-
-def get_history() -> list[dict]:
-    return list(_history)
-
-
-# ── DeepSeek call ─────────────────────────────────────────────────────────────
-
-def get_reply(user_text: str, retries: int = 3, backoff: float = 5.0) -> str:
-    """
-    Append user_text to history, call DeepSeek, return the model's reply.
-    Retries up to `retries` times on network/server errors.
-    """
-    if not _system_prompt:
-        raise RuntimeError("No system prompt set. Call ai.new_conversation() first.")
-
-    add_user_message(user_text)
+    updated_history = history + [{"role": "user", "content": user_text}]
 
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
-            {"role": "system", "content": _system_prompt},
-            *_history[-MAX_HISTORY:],
+            {"role": "system", "content": build_system_prompt(business)},
+            *updated_history[-MAX_HISTORY:],
         ],
     }
 
@@ -75,7 +52,13 @@ def get_reply(user_text: str, retries: int = 3, backoff: float = 5.0) -> str:
             data = response.json()
             logger.debug("Token usage: %s", data.get("usage"))
             reply = data["choices"][0]["message"]["content"]
-            return reply
+
+            # Record the assistant reply parts in history
+            parts = [p.strip() for p in reply.split("|||") if p.strip()]
+            for part in parts:
+                updated_history.append({"role": "assistant", "content": part})
+
+            return reply, updated_history
 
         except (requests.RequestException, KeyError) as exc:
             last_exc = exc
@@ -87,3 +70,11 @@ def get_reply(user_text: str, retries: int = 3, backoff: float = 5.0) -> str:
             time.sleep(wait)
 
     raise RuntimeError(f"DeepSeek call failed after {retries} attempts") from last_exc
+
+
+# ── Money detection ───────────────────────────────────────────────────────────
+
+def contains_money_talk(text: str) -> bool:
+    """Return True if the text likely contains pricing / money discussion."""
+    lower = text.lower()
+    return any(kw in lower for kw in MONEY_KEYWORDS)

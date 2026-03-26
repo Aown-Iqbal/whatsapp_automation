@@ -1,43 +1,51 @@
 """
-state.py — Per-chat state management with JSON persistence.
-
-Each chat is keyed by JID. State survives restarts.
+state.py — Per-chat state. Each chat lives in its own JSON file under STATES_DIR.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from config import STATE_FILE
+from config import STATES_DIR
 
 logger = logging.getLogger(__name__)
+
+_states: dict[str, "ChatState"] = {}
 
 
 @dataclass
 class ChatState:
     jid: str
-    business: dict                    # full business dict for this lead
+    business: dict
 
-    history: list[dict] = field(default_factory=list)
-    last_seen_id: Optional[str] = None
-    last_inbound_time: Optional[float] = None  # epoch seconds
+    history: list[dict]          = field(default_factory=list)
+    last_seen_id: Optional[str]  = None
+    last_inbound_time: Optional[float] = None   # epoch — last time THEY messaged us
+    opening_sent_time: Optional[float] = None   # epoch — when we sent the opening
 
-    opening_sent: bool = False
-    followup_sent: bool = False
+    opening_sent:   bool = False
+    followup_sent:  bool = False
     notified_money: bool = False
-
-    # True = we stopped proactively reaching out, but will still reply if they message
-    dormant: bool = False
+    dormant:        bool = False
 
 
-# ── Module-level store ────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-_states: dict[str, ChatState] = {}
+def _jid_to_filename(jid: str) -> str:
+    safe = jid.replace("@", "_").replace(".", "_").replace("/", "_")
+    return os.path.join(STATES_DIR, f"{safe}.json")
 
+
+def _ensure_dir() -> None:
+    os.makedirs(STATES_DIR, exist_ok=True)
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def get(jid: str) -> Optional[ChatState]:
     return _states.get(jid)
@@ -47,54 +55,55 @@ def get_all() -> list[ChatState]:
     return list(_states.values())
 
 
-def add(state: ChatState) -> None:
-    _states[state.jid] = state
-    save()
+def save_one(chat: ChatState) -> None:
+    _ensure_dir()
+    try:
+        with open(_jid_to_filename(chat.jid), "w") as f:
+            json.dump(asdict(chat), f, indent=2)
+    except Exception:
+        logger.exception("Failed to save state for %s", chat.jid)
 
 
 def save() -> None:
-    """Persist all states to disk."""
-    try:
-        serialisable = {}
-        for jid, s in _states.items():
-            d = asdict(s)
-            serialisable[jid] = d
-        with open(STATE_FILE, "w") as f:
-            json.dump(serialisable, f, indent=2)
-    except Exception:
-        logger.exception("Failed to save state")
+    for chat in _states.values():
+        save_one(chat)
 
 
 def load(leads: list[dict]) -> None:
-    """
-    Load persisted states from disk, then add any new leads that
-    aren't in the file yet.
-    """
-    persisted: dict = {}
-    try:
-        with open(STATE_FILE) as f:
-            persisted = json.load(f)
-        logger.info("Loaded %d persisted chat states", len(persisted))
-    except FileNotFoundError:
-        logger.info("No state file found, starting fresh")
-    except Exception:
-        logger.exception("Could not load state file, starting fresh")
+    _ensure_dir()
 
-    # Restore persisted chats
-    for jid, d in persisted.items():
-        _states[jid] = ChatState(**d)
+    # Load any existing state files
+    for filename in os.listdir(STATES_DIR):
+        if not filename.endswith(".json"):
+            continue
+        path = os.path.join(STATES_DIR, filename)
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            chat = ChatState(**d)
+            _states[chat.jid] = chat
+            logger.debug("Restored state: %s", chat.jid)
+        except Exception:
+            logger.exception("Could not load %s", path)
+
+    logger.info("Restored %d chat state(s) from %s/", len(_states), STATES_DIR)
 
     # Add new leads not yet in state
     for business in leads:
         jid = business["jid"]
         if jid not in _states:
-            logger.info("Adding new lead: %s (%s)", business["name"], jid)
+            logger.info("New lead: %s (%s)", business["name"], jid)
             _states[jid] = ChatState(jid=jid, business=business)
+            save_one(_states[jid])
 
-    save()
 
-
-def seconds_since_last_inbound(state: ChatState) -> Optional[float]:
-    if state.last_inbound_time is None:
+def seconds_since_last_inbound(chat: ChatState) -> Optional[float]:
+    if chat.last_inbound_time is None:
         return None
-    return time.time() - state.last_inbound_time
+    return time.time() - chat.last_inbound_time
+
+
+def seconds_since_opening(chat: ChatState) -> Optional[float]:
+    if chat.opening_sent_time is None:
+        return None
+    return time.time() - chat.opening_sent_time

@@ -1,0 +1,29 @@
+{
+  "jid": "923216550559@s.whatsapp.net",
+  "business": {
+    "name": "Test Business 1",
+    "phone": "+923216550559",
+    "facebook": "",
+    "website": "",
+    "running_ads": false,
+    "completion_score": 70,
+    "jid": "923216550559@s.whatsapp.net"
+  },
+  "history": [
+    {
+      "role": "user",
+      "content": "Start the conversation now. Send the very first greeting message to the business owner."
+    },
+    {
+      "role": "assistant",
+      "content": "Assalam o alaikum sir. Kya main \"Test Business 1\" ke owner se baat kar raha hoon."
+    }
+  ],
+  "last_seen_id": null,
+  "last_inbound_time": null,
+  "opening_sent_time": 1774486800.147361,
+  "opening_sent": true,
+  "followup_sent": false,
+  "notified_money": false,
+  "dormant": false
+}

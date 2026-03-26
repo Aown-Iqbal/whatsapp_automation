@@ -1,0 +1,20 @@
+{
+  "jid": "923250629693@s.whatsapp.net",
+  "business": {
+    "name": "Test Business 2",
+    "phone": "923250629693",
+    "facebook": "",
+    "website": "",
+    "running_ads": false,
+    "completion_score": 70,
+    "jid": "923250629693@s.whatsapp.net"
+  },
+  "history": [],
+  "last_seen_id": null,
+  "last_inbound_time": null,
+  "opening_sent_time": null,
+  "opening_sent": false,
+  "followup_sent": false,
+  "notified_money": false,
+  "dormant": false
+}
