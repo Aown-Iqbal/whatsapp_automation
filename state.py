@@ -47,10 +47,6 @@ def _ensure_dir() -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def get(jid: str) -> Optional[ChatState]:
-    return _states.get(jid)
-
-
 def get_all() -> list[ChatState]:
     return list(_states.values())
 
@@ -62,12 +58,6 @@ def save_one(chat: ChatState) -> None:
             json.dump(asdict(chat), f, indent=2)
     except Exception:
         logger.exception("Failed to save state for %s", chat.jid)
-
-
-def save() -> None:
-    for chat in _states.values():
-        save_one(chat)
-
 
 def load(leads: list[dict]) -> None:
     _ensure_dir()
@@ -95,13 +85,6 @@ def load(leads: list[dict]) -> None:
             logger.info("New lead: %s (%s)", business["name"], jid)
             _states[jid] = ChatState(jid=jid, business=business)
             save_one(_states[jid])
-
-
-def seconds_since_last_inbound(chat: ChatState) -> Optional[float]:
-    if chat.last_inbound_time is None:
-        return None
-    return time.time() - chat.last_inbound_time
-
 
 def seconds_since_opening(chat: ChatState) -> Optional[float]:
     if chat.opening_sent_time is None:

@@ -90,6 +90,26 @@ def ready_to_move_on(chat: state_store.ChatState) -> bool:
         return (secs / 3600) >= config.MOVE_ON_NO_REPLY_HOURS
 
 
+def should_send_followup(chat: state_store.ChatState) -> bool:
+    """
+    True when we should send a follow-up to a chat that has gone quiet.
+
+    Conditions:
+    - Opening was sent
+    - They have never replied
+    - We haven't sent a follow-up yet
+    - At least FOLLOWUP_AFTER_HOURS have passed since the opening
+    """
+    if chat.followup_sent:
+        return False
+    if chat.last_inbound_time is not None:
+        return False  # they did reply at some point — no need to chase
+    secs = state_store.seconds_since_opening(chat)
+    if secs is None:
+        return False
+    return (secs / 3600) >= config.FOLLOWUP_AFTER_HOURS
+
+
 # ── Inbound processing ────────────────────────────────────────────────────────
 
 def process_inbound(chat: state_store.ChatState, dry_run: bool) -> None:
@@ -113,6 +133,15 @@ def process_inbound(chat: state_store.ChatState, dry_run: bool) -> None:
 
     chat.last_seen_id = messages[0].get("id")
     inbound = [m for m in new_messages if not m.get("fromMe", True)]
+
+    if inbound:
+        logger.info(
+            "New messages from %s:",
+            chat.business["name"],
+        )
+        for m in inbound:
+            text = m.get("text") or m.get("body") or "[no text]"
+            logger.info("  ↳ %s", text[:80])
 
     if not inbound:
         state_store.save_one(chat)
@@ -144,6 +173,8 @@ def process_inbound(chat: state_store.ChatState, dry_run: bool) -> None:
 def run(dry_run: bool = False) -> None:
     whatsapp.start_sync()
     logger.info("wacli sync started")
+    time.sleep(10)  
+    logger.info("Starting main loop")
 
     try:
         while True:
@@ -186,12 +217,20 @@ def run(dry_run: bool = False) -> None:
                         last.business["name"], remaining / 60,
                     )
 
-            # ── Poll all opened chats for replies ─────────────────────────────
+            # ── Poll all opened chats for replies and send follow-ups ─────────
             for chat in opened:
+                # Check for inbound messages first
                 try:
                     process_inbound(chat, dry_run)
                 except Exception as exc:
                     logger.error("Inbound error for %s: %s", chat.jid, exc)
+
+                # Send follow-up if they've gone quiet long enough
+                if should_send_followup(chat):
+                    try:
+                        send_followup(chat, dry_run)
+                    except Exception as exc:
+                        logger.error("Follow-up failed for %s: %s", chat.jid, exc)
 
             time.sleep(config.POLL_INTERVAL_SECONDS)
 
