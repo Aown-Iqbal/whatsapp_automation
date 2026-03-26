@@ -7,7 +7,7 @@ import logging
 import os
 import re
 
-from config import LEADS_CSV, FALLBACK_LEADS
+from config import LEADS_CSV
 
 logger = logging.getLogger(__name__)
 

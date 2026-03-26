@@ -23,15 +23,25 @@ class ChatState:
     jid: str
     business: dict
 
-    history: list[dict]          = field(default_factory=list)
-    last_seen_id: Optional[str]  = None
-    last_inbound_time: Optional[float] = None   # epoch — last time THEY messaged us
-    opening_sent_time: Optional[float] = None   # epoch — when we sent the opening
+    history: list[dict]                    = field(default_factory=list)
+    last_seen_id: Optional[str]            = None
+    last_inbound_time: Optional[float]     = None   # epoch — last time THEY messaged us
+    opening_sent_time: Optional[float]     = None   # epoch — when we sent the opening
 
     opening_sent:   bool = False
     followup_sent:  bool = False
     notified_money: bool = False
     dormant:        bool = False
+
+    # ── New structured-decision flags ─────────────────────────────────────────
+    converted:        bool = False   # LLM detected genuine interest/conversion
+    requires_human:   bool = False   # LLM escalated; no more automated replies
+    ended:            bool = False   # LLM ended the conversation (not interested)
+
+    @property
+    def is_active(self) -> bool:
+        """False when no more automated messages should be sent to this lead."""
+        return not (self.requires_human or self.ended)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -47,6 +57,10 @@ def _ensure_dir() -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def get(jid: str) -> Optional[ChatState]:
+    return _states.get(jid)
+
+
 def get_all() -> list[ChatState]:
     return list(_states.values())
 
@@ -59,10 +73,15 @@ def save_one(chat: ChatState) -> None:
     except Exception:
         logger.exception("Failed to save state for %s", chat.jid)
 
+
+def save() -> None:
+    for chat in _states.values():
+        save_one(chat)
+
+
 def load(leads: list[dict]) -> None:
     _ensure_dir()
 
-    # Load any existing state files
     for filename in os.listdir(STATES_DIR):
         if not filename.endswith(".json"):
             continue
@@ -70,6 +89,10 @@ def load(leads: list[dict]) -> None:
         try:
             with open(path) as f:
                 d = json.load(f)
+            # Backwards-compat: inject new flags if missing from old JSON files
+            d.setdefault("converted", False)
+            d.setdefault("requires_human", False)
+            d.setdefault("ended", False)
             chat = ChatState(**d)
             _states[chat.jid] = chat
             logger.debug("Restored state: %s", chat.jid)
@@ -78,13 +101,19 @@ def load(leads: list[dict]) -> None:
 
     logger.info("Restored %d chat state(s) from %s/", len(_states), STATES_DIR)
 
-    # Add new leads not yet in state
     for business in leads:
         jid = business["jid"]
         if jid not in _states:
             logger.info("New lead: %s (%s)", business["name"], jid)
             _states[jid] = ChatState(jid=jid, business=business)
             save_one(_states[jid])
+
+
+def seconds_since_last_inbound(chat: ChatState) -> Optional[float]:
+    if chat.last_inbound_time is None:
+        return None
+    return time.time() - chat.last_inbound_time
+
 
 def seconds_since_opening(chat: ChatState) -> Optional[float]:
     if chat.opening_sent_time is None:

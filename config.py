@@ -5,7 +5,7 @@ WACLI = "wacli"
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 # Your own WhatsApp JID — gets alerted when a chat turns to money
-NOTIFY_JID = os.getenv("NOTIFY_JID", "923001234567@s.whatsapp.net")
+NOTIFY_JID = os.getenv("NOTIFY_JID", "923708454525@s.whatsapp.net")
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 WAIT_AFTER_REPLY_SECONDS  = 20   # pause before replying (they may still be typing)
@@ -22,11 +22,3 @@ DEEPSEEK_MODEL   = "deepseek-chat"
 MAX_HISTORY      = 50
 
 LEADS_CSV = "leads.csv"
-
-# ── Money-detection keywords ──────────────────────────────────────────────────
-MONEY_KEYWORDS = [
-    "price", "rate", "charge", "cost", "budget", "fee", "fees",
-    "rupee", "rupees", "rs", "payment", "pay", "paid", "invoice",
-    "paisa", "paise", "amount", "package", "packages",
-    "how much", "kya rate", "kya charges",
-]
