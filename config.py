@@ -1,26 +1,22 @@
 import os
 
 # ── wacli binary ──────────────────────────────────────────────────────────────
-# Use an absolute path or leave as "wacli" if it's on your PATH.
 WACLI = "wacli"
-TARGET_JID = "242142018560089@lid"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+STATE_DIR = "state"        # folder where per-lead JSON state files live
+CSV_PATH  = "leads.csv"    # input CSV: phone,name,facebook,website,running_ads,completion_score
+
+# ── Notify ────────────────────────────────────────────────────────────────────
+# This number receives alerts when the AI encounters something it can't handle
+OWNER_JID = "923708454525@s.whatsapp.net"
 
 # ── Timing ────────────────────────────────────────────────────────────────────
-WAIT_AFTER_REPLY_SECONDS = 20   # how long to wait after detecting a reply
-POLL_INTERVAL_SECONDS    = 5    # how often to check for new messages
-MULTI_MESSAGE_DELAY      = 2    # pause between split messages (|||)
+WAIT_AFTER_REPLY_SECONDS = 20   # wait after first new message before fetching again
+POLL_INTERVAL_SECONDS    = 5    # how often the main loop cycles through all leads
 
 # ── AI ────────────────────────────────────────────────────────────────────────
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "YOUR_API_KEY_HERE")
-DEEPSEEK_MODEL   = "deepseek-chat"
-MAX_HISTORY      = 50           # how many messages of history to send to the model
-
-# ── Business data (dummy — will come from CSV in production) ──────────────────
-BUSINESS = {
-    "name":             "Haroon's Electronics",
-    "owner_phone":      TARGET_JID,
-    "facebook":         "https://facebook.com/haroonelectronics",
-    "website":          "haroonelectronics.com",
-    "running_ads":      False,
-    "completion_score": 75,
-}
+DEEPSEEK_API_KEY     = "sk-c749d369622646aeaf909f89b33e2648"
+DEEPSEEK_MODEL       = "deepseek-chat"
+MAX_HISTORY          = 50   # max history messages sent to the model per turn
+MAX_TOOL_ITERATIONS  = 5    # max agentic loop iterations per turn (safety cap)

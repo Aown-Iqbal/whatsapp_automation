@@ -1,0 +1,44 @@
+{
+  "phone": "923216550559",
+  "jid": "923216550559@s.whatsapp.net",
+  "business": {
+    "name": "Haroon's Electronics Shop",
+    "facebook": "https://facebook.com/haroonelectronics",
+    "website": "haroondildoservices.com",
+    "running_ads": false,
+    "completion_score": 75
+  },
+  "status": "active",
+  "campaign_start_at": "2026-03-29T03:31:10.561616+00:00",
+  "last_processed_at": "2026-03-29T08:32:16.965201+00:00",
+  "llm_history": [
+    {
+      "role": "assistant",
+      "content": "Assalam o alaikum sir"
+    },
+    {
+      "role": "assistant",
+      "content": "Kya main Haroon's Electronics Shop ke owner se baat kar raha hoon"
+    },
+    {
+      "role": "assistant",
+      "content": "Mera naam Ali hai aur main ek digital marketing agency se hoon"
+    },
+    {
+      "role": "assistant",
+      "content": "Aapka Facebook page dekha hai maine"
+    },
+    {
+      "role": "assistant",
+      "content": "Aapki online presence solid hai sir"
+    },
+    {
+      "role": "user",
+      "content": "Yes"
+    },
+    {
+      "role": "user",
+      "content": "Oil up ali ahh diddy blud"
+    }
+  ]
+}

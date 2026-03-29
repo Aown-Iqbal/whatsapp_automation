@@ -3,7 +3,7 @@ import logging
 import subprocess
 import time
 
-from config import MULTI_MESSAGE_DELAY, WACLI
+from config import WACLI
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +37,14 @@ def stop_sync() -> None:
 
 # ── Message retrieval ─────────────────────────────────────────────────────────
 
-def get_messages(jid: str) -> list[dict]:
+def get_messages(jid: str, limit: int = 20) -> list[dict]:
     """
-    Fetch the message list for a given JID.
-    Returns a list of message dicts (newest first).
-    Raises RuntimeError if wacli returns a non-zero exit code.
+    Fetch recent messages for a specific chat JID.
+    Returns a list of message dicts ordered newest first.
+    Raises RuntimeError on failure.
     """
     result = subprocess.run(
-        [WACLI, "messages", "list", "--chat", jid, "--json"],
+        [WACLI, "messages", "list", "--chat", jid, "--limit", str(limit), "--json"],
         capture_output=True,
         text=True,
         timeout=15,
@@ -64,31 +64,22 @@ def get_messages(jid: str) -> list[dict]:
 
 # ── Sending ───────────────────────────────────────────────────────────────────
 
-def send_message(jid: str, text: str) -> list[str]:
+def send_message(jid: str, text: str) -> None:
     """
-    Send one or more messages to a JID.
-    Text may contain ||| separators — each part is sent as a separate message
-    with a short delay between them.
-    Returns the list of parts that were sent.
+    Send a single message to a JID.
+    No ||| splitting — the AI calls this tool once per message it wants to send.
+    Raises RuntimeError on failure.
     """
-    parts = [p.strip() for p in text.split("|||") if p.strip()]
+    result = subprocess.run(
+        [WACLI, "send", "text", "--to", jid, "--message", text],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
 
-    for i, part in enumerate(parts):
-        result = subprocess.run(
-            [WACLI, "send", "text", "--to", jid, "--message", part],
-            capture_output=True,
-            text=True,
-            timeout=15,
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"wacli send failed (exit {result.returncode}): {result.stderr.strip()}"
         )
 
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"wacli send failed (exit {result.returncode}): {result.stderr.strip()}"
-            )
-
-        logger.info("Sent: %s", part)
-
-        if i < len(parts) - 1:
-            time.sleep(MULTI_MESSAGE_DELAY)
-
-    return parts
+    logger.info("Sent to %s: %s", jid, text)

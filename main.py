@@ -1,11 +1,14 @@
+import csv
 import logging
 import time
+from datetime import datetime, timezone
 
 import ai
+import state as state_manager
 import whatsapp
 from config import (
+    CSV_PATH,
     POLL_INTERVAL_SECONDS,
-    TARGET_JID,
     WAIT_AFTER_REPLY_SECONDS,
 )
 
@@ -18,28 +21,214 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── CSV loading ───────────────────────────────────────────────────────────────
 
-def collect_their_messages(messages: list[dict], since_id: str) -> str:
+def load_leads(path: str) -> list[dict]:
     """
-    Walk the message list (newest first) and collect all consecutive inbound
-    messages that arrived after since_id, then return them as one combined string.
+    Load leads from CSV. Expected columns:
+        phone, name, facebook, website, running_ads, completion_score
+
+    Example row:
+        923001234567,Ali's Electronics,https://facebook.com/aliselectronics,aliselectronics.com,false,72
     """
-    new_parts: list[str] = []
-    for msg in messages:
-        if msg["MsgID"] == since_id:
-            break
-        if msg["FromMe"]:
-            break
-        text = msg.get("Text") or msg.get("DisplayText") or ""
-        new_parts.append(text)
-    return " ".join(reversed(new_parts)).strip()
+    leads = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            leads.append({
+                "phone": row["phone"].strip(),
+                "business": {
+                    "name":             row["name"].strip(),
+                    "facebook":         row.get("facebook", "").strip(),
+                    "website":          row.get("website", "").strip(),
+                    "running_ads":      row.get("running_ads", "false").strip().lower() == "true",
+                    "completion_score": int(row.get("completion_score", 0)),
+                },
+            })
+    return leads
 
 
-def send_and_record(jid: str, reply: str) -> None:
-    """Send a reply and record every part in the AI history."""
-    parts = whatsapp.send_message(jid, reply)
-    ai.add_assistant_messages(parts)
+# ── Timestamp helpers ─────────────────────────────────────────────────────────
+
+def _parse_ts(ts_str: str) -> datetime:
+    """Parse wacli's ISO 8601 UTC timestamp string into a timezone-aware datetime."""
+    # wacli returns e.g. "2026-03-28T08:46:58Z" — replace Z for Python compat
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+
+# ── Per-lead processing ───────────────────────────────────────────────────────
+
+def process_lead(state: dict) -> None:
+    """
+    Check a single lead for new messages (inbound or manual outbound) and act.
+
+    - human_needed leads: still sync history so the AI has full context when
+      control is handed back — just don't trigger the AI to reply.
+    - active leads: sync manual outbound messages into history, then trigger
+      the AI if there are new inbound messages.
+    """
+    jid = state["jid"]
+    last_processed_at = state.get("last_processed_at")
+    is_human_needed   = state.get("status") == "human_needed"
+
+    # ── Fetch recent messages for this chat ───────────────────────────────────
+    try:
+        messages = whatsapp.get_messages(jid, limit=20)
+    except RuntimeError as exc:
+        logger.error("[%s] Failed to fetch messages: %s", state["phone"], exc)
+        return
+
+    if not messages:
+        return
+
+    # ── Quick check: anything newer than our cursor at all? ──────────────────
+    if last_processed_at:
+        latest_ts = _parse_ts(messages[0]["Timestamp"])
+        cursor_ts = _parse_ts(last_processed_at)
+        logger.info(
+            "[%s] Latest msg: %s | Cursor: %s | FromMe: %s",
+            state["phone"], latest_ts.isoformat(), cursor_ts.isoformat(), messages[0]["FromMe"],
+        )
+        if latest_ts <= cursor_ts:
+            return  # nothing new
+
+    # ── If the newest message is inbound, wait for them to finish typing ──────
+    if not messages[0]["FromMe"]:
+        logger.info("[%s] New message detected, waiting %ds...", state["phone"], WAIT_AFTER_REPLY_SECONDS)
+        time.sleep(WAIT_AFTER_REPLY_SECONDS)
+
+        try:
+            messages = whatsapp.get_messages(jid, limit=20)
+        except RuntimeError as exc:
+            logger.error("[%s] Failed to re-fetch messages: %s", state["phone"], exc)
+            return
+
+    # ── Collect ALL new messages since the cursor (inbound + manual outbound) ─
+    # (timestamp, from_me, text, media_type)
+    new_messages: list[tuple[datetime, bool, str, str]] = []
+
+    for msg in messages:  # newest first
+        if last_processed_at:
+            ts = _parse_ts(msg["Timestamp"])
+            if ts <= _parse_ts(last_processed_at):
+                break  # hit something we've already processed
+
+        text       = msg.get("Text") or msg.get("DisplayText") or ""
+        media_type = msg.get("MediaType") or ""
+        new_messages.append((_parse_ts(msg["Timestamp"]), msg["FromMe"], text, media_type))
+
+    if not new_messages:
+        return
+
+    # Sort chronologically (wacli returns newest first)
+    new_messages.sort(key=lambda x: x[0])
+    latest_ts = new_messages[-1][0]
+
+    # ── Separate inbound from manual outbound ─────────────────────────────────
+    new_inbound         = [(ts, text, mt) for ts, from_me, text, mt in new_messages if not from_me]
+    new_manual_outbound = [(ts, text)     for ts, from_me, text, mt in new_messages if from_me]
+
+    # ── Sync ALL new messages into history in chronological order ────────────
+    # Both manual outbound (role: assistant) and inbound (role: user) are written
+    # so the AI always sees a complete, accurate conversation when it takes over.
+    for ts, from_me, text, media_type in new_messages:
+        if from_me:
+            if text:
+                state["llm_history"].append({"role": "assistant", "content": text})
+                logger.info("[%s] Human sent (synced to history): %s", state["phone"], text)
+        else:
+            content = text if text else (f"[{media_type} message]" if media_type else "")
+            if content:
+                state["llm_history"].append({"role": "user", "content": content})
+                logger.info("[%s] Lead said (synced to history): %s", state["phone"], content)
+
+    # ── human_needed: sync only, no AI trigger ────────────────────────────────
+    if is_human_needed:
+        if new_messages:
+            state["last_processed_at"] = latest_ts.isoformat()
+            state_manager.save(state)
+        return
+
+    # ── Nothing inbound to reply to ───────────────────────────────────────────
+    if not new_inbound:
+        if new_messages:
+            state["last_processed_at"] = latest_ts.isoformat()
+            state_manager.save(state)
+        return
+
+    # ── Build combined inbound text for the AI ────────────────────────────────
+    parts = []
+    for _, text, media_type in new_inbound:
+        if text:
+            parts.append(text)
+        elif media_type:
+            # Non-text content — describe it so AI can decide to notify owner
+            parts.append(f"[{media_type} message]")
+
+    combined_text = " ".join(parts).strip()
+    if not combined_text:
+        logger.warning("[%s] New inbound messages had no extractable content", state["phone"])
+        state["last_processed_at"] = latest_ts.isoformat()
+        state_manager.save(state)
+        return
+
+    logger.info("[%s] They said: %s", state["phone"], combined_text)
+
+    # ── Run AI turn ───────────────────────────────────────────────────────────
+    try:
+        result = ai.run_turn(
+            jid=jid,
+            history=state["llm_history"],
+            business=state["business"],
+            user_message=combined_text,
+        )
+    except RuntimeError as exc:
+        logger.error("[%s] AI turn failed: %s", state["phone"], exc)
+        return
+
+    # ── Update and persist state ──────────────────────────────────────────────
+    state["llm_history"] = result["history"]
+
+    # Cursor set to NOW (not the lead's message timestamp) so that the AI's
+    # own outbound messages — which land in wacli with timestamps around now —
+    # are behind the cursor on the next poll and never re-synced as manual messages.
+    state["last_processed_at"] = datetime.now(timezone.utc).isoformat()
+
+    if result["owner_notified"]:
+        state["status"] = "human_needed"
+
+    state_manager.save(state)
+
+    if result["messages_sent"]:
+        logger.info("[%s] Sent %d message(s)", state["phone"], len(result["messages_sent"]))
+    else:
+        logger.info("[%s] AI chose not to reply", state["phone"])
+
+
+# ── Opening message ───────────────────────────────────────────────────────────
+
+def send_opening(state: dict) -> None:
+    """Send the opening message to a new lead and initialise their state cursor."""
+    logger.info("[%s] Sending opening message...", state["phone"])
+
+    try:
+        result = ai.run_turn(
+            jid=state["jid"],
+            history=[],
+            business=state["business"],
+            user_message=None,  # signals opening turn
+        )
+    except RuntimeError as exc:
+        logger.error("[%s] Failed to generate opening: %s", state["phone"], exc)
+        return
+
+    # Cursor is set to right now — safe, no wacli fetch, no race condition
+    state_manager.mark_opened(state)
+
+    # Persist whatever the AI sent as the start of history
+    state["llm_history"] = result["history"]
+    state_manager.save(state)
+
+    logger.info("[%s] Opening sent", state["phone"])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -48,64 +237,43 @@ def main() -> None:
     whatsapp.start_sync()
     logger.info("Sync started")
 
-    # ── Opening message ───────────────────────────────────────────────────────
-    logger.info("Generating opening message...")
-    opening = ai.get_reply("generate the opening message")
-    send_and_record(TARGET_JID, opening)
-    logger.info("Opening sent, waiting for reply...")
+    leads = load_leads(CSV_PATH)
+    logger.info("Loaded %d lead(s) from %s", len(leads), CSV_PATH)
 
-    # Record the last message we sent so we don't re-process it
-    messages = whatsapp.get_messages(TARGET_JID)
-    last_seen_id: str | None = messages[0]["MsgID"] if messages else None
+    # ── Initialise new leads and send openings ────────────────────────────────
+    active_states: list[dict] = []
+
+    for lead in leads:
+        phone    = lead["phone"]
+        business = lead["business"]
+
+        existing = state_manager.load(phone)
+
+        if existing is None:
+            # Brand new lead — create state and send opening
+            state = state_manager.create(phone, business)
+            send_opening(state)
+            active_states.append(state)
+        else:
+            # Already known — just load and keep polling
+            active_states.append(existing)
+            logger.info("[%s] Resuming existing conversation (status: %s)", phone, existing.get("status"))
+
+    if not active_states:
+        logger.warning("No leads to process. Check %s", CSV_PATH)
+        return
 
     # ── Poll loop ─────────────────────────────────────────────────────────────
+    logger.info("Starting poll loop for %d lead(s)...", len(active_states))
     while True:
+        for state in active_states:
+            try:
+                process_lead(state)
+            except Exception as exc:
+                # Never let one bad lead crash the whole loop
+                logger.exception("[%s] Unexpected error: %s", state["phone"], exc)
+
         time.sleep(POLL_INTERVAL_SECONDS)
-
-        try:
-            messages = whatsapp.get_messages(TARGET_JID)
-        except RuntimeError as exc:
-            logger.error("Failed to fetch messages: %s", exc)
-            continue
-
-        if not messages:
-            continue
-
-        latest = messages[0]
-
-        # Ignore our own messages and anything we've already processed
-        if latest["FromMe"] or latest["MsgID"] == last_seen_id:
-            continue
-
-        # New inbound message detected — wait in case they're still typing
-        logger.info("New message detected, waiting %ds...", WAIT_AFTER_REPLY_SECONDS)
-        time.sleep(WAIT_AFTER_REPLY_SECONDS)
-
-        # Re-fetch after the wait; collect everything they sent since last_seen_id
-        try:
-            messages = whatsapp.get_messages(TARGET_JID)
-        except RuntimeError as exc:
-            logger.error("Failed to re-fetch messages: %s", exc)
-            continue
-
-        combined_text = collect_their_messages(messages, last_seen_id)
-        if not combined_text:
-            logger.warning("Could not extract text from new messages, skipping")
-            continue
-
-        last_seen_id = messages[0]["MsgID"]
-        logger.info("They said: %s", combined_text)
-
-        try:
-            reply = ai.get_reply(combined_text)
-        except RuntimeError as exc:
-            logger.error("AI call failed: %s", exc)
-            continue
-
-        try:
-            send_and_record(TARGET_JID, reply)
-        except RuntimeError as exc:
-            logger.error("Failed to send message: %s", exc)
 
 
 if __name__ == "__main__":
