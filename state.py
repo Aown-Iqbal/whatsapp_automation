@@ -1,121 +1,57 @@
-"""
-state.py — Per-chat state. Each chat lives in its own JSON file under STATES_DIR.
-"""
-
-from __future__ import annotations
-
 import json
 import logging
-import os
-import time
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from datetime import datetime, timezone
+from pathlib import Path
 
-from config import STATES_DIR
+from config import STATE_DIR
 
 logger = logging.getLogger(__name__)
 
-_states: dict[str, "ChatState"] = {}
+
+def _path(phone: str) -> Path:
+    d = Path(STATE_DIR)
+    d.mkdir(exist_ok=True)
+    return d / f"{phone}.json"
 
 
-@dataclass
-class ChatState:
-    jid: str
-    business: dict
-
-    history: list[dict]                    = field(default_factory=list)
-    last_seen_id: Optional[str]            = None
-    last_inbound_time: Optional[float]     = None   # epoch — last time THEY messaged us
-    opening_sent_time: Optional[float]     = None   # epoch — when we sent the opening
-
-    opening_sent:   bool = False
-    followup_sent:  bool = False
-    notified_money: bool = False
-    dormant:        bool = False
-
-    # ── New structured-decision flags ─────────────────────────────────────────
-    converted:        bool = False   # LLM detected genuine interest/conversion
-    requires_human:   bool = False   # LLM escalated; no more automated replies
-    ended:            bool = False   # LLM ended the conversation (not interested)
-
-    @property
-    def is_active(self) -> bool:
-        """False when no more automated messages should be sent to this lead."""
-        return not (self.requires_human or self.ended)
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _jid_to_filename(jid: str) -> str:
-    safe = jid.replace("@", "_").replace(".", "_").replace("/", "_")
-    return os.path.join(STATES_DIR, f"{safe}.json")
-
-
-def _ensure_dir() -> None:
-    os.makedirs(STATES_DIR, exist_ok=True)
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def get(jid: str) -> Optional[ChatState]:
-    return _states.get(jid)
-
-
-def get_all() -> list[ChatState]:
-    return list(_states.values())
-
-
-def save_one(chat: ChatState) -> None:
-    _ensure_dir()
-    try:
-        with open(_jid_to_filename(chat.jid), "w") as f:
-            json.dump(asdict(chat), f, indent=2)
-    except Exception:
-        logger.exception("Failed to save state for %s", chat.jid)
-
-
-def save() -> None:
-    for chat in _states.values():
-        save_one(chat)
-
-
-def load(leads: list[dict]) -> None:
-    _ensure_dir()
-
-    for filename in os.listdir(STATES_DIR):
-        if not filename.endswith(".json"):
-            continue
-        path = os.path.join(STATES_DIR, filename)
-        try:
-            with open(path) as f:
-                d = json.load(f)
-            # Backwards-compat: inject new flags if missing from old JSON files
-            d.setdefault("converted", False)
-            d.setdefault("requires_human", False)
-            d.setdefault("ended", False)
-            chat = ChatState(**d)
-            _states[chat.jid] = chat
-            logger.debug("Restored state: %s", chat.jid)
-        except Exception:
-            logger.exception("Could not load %s", path)
-
-    logger.info("Restored %d chat state(s) from %s/", len(_states), STATES_DIR)
-
-    for business in leads:
-        jid = business["jid"]
-        if jid not in _states:
-            logger.info("New lead: %s (%s)", business["name"], jid)
-            _states[jid] = ChatState(jid=jid, business=business)
-            save_one(_states[jid])
-
-
-def seconds_since_last_inbound(chat: ChatState) -> Optional[float]:
-    if chat.last_inbound_time is None:
+def load(phone: str) -> dict | None:
+    p = _path(phone)
+    if not p.exists():
         return None
-    return time.time() - chat.last_inbound_time
+    with open(p) as f:
+        return json.load(f)
 
 
-def seconds_since_opening(chat: ChatState) -> Optional[float]:
-    if chat.opening_sent_time is None:
-        return None
-    return time.time() - chat.opening_sent_time
+def save(state: dict) -> None:
+    p = _path(state["phone"])
+    with open(p, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+def create(phone: str, business: dict) -> dict:
+    """Create a fresh state file for a new lead."""
+    state = {
+        "phone": phone,
+        "jid": f"{phone}@s.whatsapp.net",
+        "business": business,
+        "status": "pending",
+        "campaign_start_at": None,
+        "last_processed_at": None,
+        "llm_history": [],
+    }
+    save(state)
+    return state
+
+
+def mark_opened(state: dict) -> dict:
+    """
+    Called immediately after sending the opening message.
+    Sets campaign_start_at and last_processed_at to right now (local Python clock).
+    No wacli fetch needed — no race condition possible.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    state["campaign_start_at"] = now
+    state["last_processed_at"] = now
+    state["status"] = "active"
+    save(state)
+    return state

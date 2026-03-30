@@ -1,3 +1,2 @@
-name,phone,facebook,website,running_ads,completion_score
-Test Business 1,+923216550559,,,false,70
-Test Business 2,923250629693,,,false,70
+phone,name,facebook,website,running_ads,completion_score
+923250629693,Ali Mobile Center,https://facebook.com/alimmobilecenter,alimobilecenter.pk,true,62

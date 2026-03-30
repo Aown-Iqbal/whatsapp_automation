@@ -1,333 +1,288 @@
-"""
-main.py — WhatsApp outreach bot.
-
-Usage:
-    python main.py [leads.csv] [--dry-run]
-"""
-
-import argparse
+import csv
 import logging
-import sys
 import time
+from datetime import datetime, timezone
 
-import config
-import reporter
-import state as state_store
+import ai
+import state as state_manager
 import whatsapp
-from ai import get_decision
-from leads import load_leads
-from prompt import OPENING_TRIGGER, FOLLOWUP_TRIGGER
+from config import (
+    CSV_PATH,
+    POLL_INTERVAL_SECONDS,
+    WAIT_AFTER_REPLY_SECONDS,
+)
 
+# ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── CSV loading ───────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("csv", nargs="?", default=None)
-    parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
-
-
-# ── Send helpers ──────────────────────────────────────────────────────────────
-
-def send(jid: str, text: str, dry_run: bool) -> None:
-    if dry_run:
-        logger.info("[DRY-RUN] → %s: %s", jid, text[:120])
-        return
-    whatsapp.send_message(jid, text)
-
-
-# ── Opening / follow-up ───────────────────────────────────────────────────────
-
-def send_opening(chat: state_store.ChatState, dry_run: bool) -> None:
-    if not chat.is_active:
-        logger.info("Skipping opening for inactive lead %s", chat.business["name"])
-        return
-
-    logger.info("Opening → %s (%s)", chat.business["name"], chat.jid)
-    decision, updated_history = get_decision(chat.business, [], OPENING_TRIGGER)
-    _apply_decision(chat, decision, trigger_text=OPENING_TRIGGER, dry_run=dry_run)
-    chat.history           = updated_history
-    chat.opening_sent      = True
-    chat.opening_sent_time = time.time()
-    state_store.save_one(chat)
-
-
-def send_followup(chat: state_store.ChatState, dry_run: bool) -> None:
-    if not chat.is_active:
-        return
-
-    logger.info("Follow-up → %s (%s)", chat.business["name"], chat.jid)
-    decision, updated_history = get_decision(chat.business, chat.history, FOLLOWUP_TRIGGER)
-    _apply_decision(chat, decision, trigger_text=FOLLOWUP_TRIGGER, dry_run=dry_run)
-    chat.history       = updated_history
-    chat.followup_sent = True
-    state_store.save_one(chat)
-
-
-def needs_followup(chat: state_store.ChatState) -> bool:
-    """True when a follow-up should be sent: opening done, no reply yet, timer elapsed."""
-    if not chat.is_active:
-        return False
-    if not chat.opening_sent:
-        return False
-    if chat.followup_sent:
-        return False
-    if chat.last_inbound_time is not None:
-        # They already replied — no follow-up needed
-        return False
-    secs = state_store.seconds_since_opening(chat)
-    if secs is None:
-        return False
-    return (secs / 3600) >= config.FOLLOWUP_AFTER_HOURS
-
-
-# ── Core action dispatcher ────────────────────────────────────────────────────
-
-def _apply_decision(
-    chat: state_store.ChatState,
-    decision,
-    trigger_text: str,
-    dry_run: bool,
-) -> None:
-    # ── Money talk ────────────────────────────────────────────────────────────
-    if decision.money_talk_detected and not chat.notified_money:
-        logger.info("Money talk detected — %s", chat.business["name"])
-        chat.notified_money = True
-        reporter.money_talk(jid=chat.jid, business=chat.business, dry_run=dry_run)
-
-    # ── Conversion ────────────────────────────────────────────────────────────
-    if decision.conversion_detected and not chat.converted:
-        logger.info("Conversion detected — %s", chat.business["name"])
-        chat.converted = True
-        reporter.conversion(
-            jid=chat.jid,
-            business=chat.business,
-            reasoning=decision.reasoning,
-            dry_run=dry_run,
-        )
-
-    # ── Action ────────────────────────────────────────────────────────────────
-    if decision.action == "reply":
-        if decision.reply_text:
-            send(chat.jid, decision.reply_text, dry_run)
-        else:
-            logger.warning(
-                "LLM chose 'reply' but reply_text is empty for %s — skipping send",
-                chat.business["name"],
-            )
-
-    elif decision.action == "ignore":
-        logger.info("LLM ignoring message from %s", chat.business["name"])
-
-    elif decision.action == "end_conversation":
-        logger.info("Ending conversation with %s — %s", chat.business["name"], decision.reasoning)
-        chat.ended = True
-
-    elif decision.action == "request_human":
-        logger.info("Escalating %s to human — %s", chat.business["name"], decision.reasoning)
-        chat.requires_human = True
-        reporter.human_needed(
-            jid=chat.jid,
-            business=chat.business,
-            last_message=trigger_text,
-            reasoning=decision.reasoning,
-            dry_run=dry_run,
-        )
-
-    else:
-        logger.error("Unknown action %r from LLM — escalating to human", decision.action)
-        chat.requires_human = True
-
-
-# ── Queue logic ───────────────────────────────────────────────────────────────
-
-def ready_to_move_on(chat: state_store.ChatState) -> bool:
+def load_leads(path: str) -> list[dict]:
     """
-    True when we should stop waiting on this lead and open the next one.
+    Load leads from CSV. Expected columns:
+        phone, name, facebook, website, running_ads, completion_score
 
-    - Inactive (human/ended) → move on immediately
-    - They replied  → wait MOVE_ON_REPLIED_HOURS after their last message
-    - No reply yet  → wait MOVE_ON_NO_REPLY_HOURS after we sent the opening
-                      (must be > FOLLOWUP_AFTER_HOURS so the follow-up fires first)
+    Example row:
+        923001234567,Ali's Electronics,https://facebook.com/aliselectronics,aliselectronics.com,false,72
     """
-    if not chat.is_active:
-        return True
+    leads = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            leads.append({
+                "phone": row["phone"].strip(),
+                "business": {
+                    "name":             row["name"].strip(),
+                    "facebook":         row.get("facebook", "").strip(),
+                    "website":          row.get("website", "").strip(),
+                    "running_ads":      row.get("running_ads", "false").strip().lower() == "true",
+                    "completion_score": int(row.get("completion_score", 0)),
+                },
+            })
+    return leads
 
-    if chat.last_inbound_time is not None:
-        hours = (time.time() - chat.last_inbound_time) / 3600
-        return hours >= config.MOVE_ON_REPLIED_HOURS
-    else:
-        secs = state_store.seconds_since_opening(chat)
-        if secs is None:
-            return False
-        return (secs / 3600) >= config.MOVE_ON_NO_REPLY_HOURS
+
+# ── Timestamp helpers ─────────────────────────────────────────────────────────
+
+def _parse_ts(ts_str: str) -> datetime:
+    """Parse wacli's ISO 8601 UTC timestamp string into a timezone-aware datetime."""
+    # wacli returns e.g. "2026-03-28T08:46:58Z" — replace Z for Python compat
+    return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
 
 
-# ── Inbound processing ────────────────────────────────────────────────────────
+# ── Per-lead processing ───────────────────────────────────────────────────────
 
-def process_inbound(chat: state_store.ChatState, dry_run: bool) -> None:
-    if not chat.is_active:
-        logger.debug("process_inbound: chat %s not active", chat.jid)
-        return
+def process_lead(state: dict) -> None:
+    """
+    Check a single lead for new messages (inbound or manual outbound) and act.
 
+    - human_needed leads: still sync history so the AI has full context when
+      control is handed back — just don't trigger the AI to reply.
+    - active leads: sync manual outbound messages into history, then trigger
+      the AI if there are new inbound messages.
+    """
+    jid = state["jid"]
+    last_processed_at = state.get("last_processed_at")
+    is_human_needed   = state.get("status") == "human_needed"
+
+    # ── Fetch recent messages for this chat ───────────────────────────────────
     try:
-        messages = whatsapp.get_messages(chat.jid)
-        logger.debug("process_inbound: got %d messages for %s", len(messages), chat.jid)
+        messages = whatsapp.get_messages(jid, limit=20)
     except RuntimeError as exc:
-        logger.warning("Could not fetch messages for %s: %s", chat.jid, exc)
+        logger.error("[%s] Failed to fetch messages: %s", state["phone"], exc)
         return
 
     if not messages:
-        logger.debug("process_inbound: no messages for %s", chat.jid)
         return
 
-    new_messages = []
-    for msg in messages:
-        msg_id = msg.get("id")
-        if msg_id is not None and msg_id == chat.last_seen_id:
-            logger.debug("process_inbound: reached last_seen_id %s for %s", chat.last_seen_id, chat.jid)
-            break
-        new_messages.append(msg)
+    # ── Quick check: anything newer than our cursor at all? ──────────────────
+    if last_processed_at:
+        latest_ts = _parse_ts(messages[0]["Timestamp"])
+        cursor_ts = _parse_ts(last_processed_at)
+        logger.info(
+            "[%s] Latest msg: %s | Cursor: %s | FromMe: %s",
+            state["phone"], latest_ts.isoformat(), cursor_ts.isoformat(), messages[0]["FromMe"],
+        )
+        if latest_ts <= cursor_ts:
+            return  # nothing new
+
+    # ── If the newest message is inbound, wait for them to finish typing ──────
+    if not messages[0]["FromMe"]:
+        logger.info("[%s] New message detected, waiting %ds...", state["phone"], WAIT_AFTER_REPLY_SECONDS)
+        time.sleep(WAIT_AFTER_REPLY_SECONDS)
+
+        try:
+            messages = whatsapp.get_messages(jid, limit=20)
+        except RuntimeError as exc:
+            logger.error("[%s] Failed to re-fetch messages: %s", state["phone"], exc)
+            return
+
+    # ── Collect ALL new messages since the cursor (inbound + manual outbound) ─
+    # (timestamp, from_me, text, media_type)
+    new_messages: list[tuple[datetime, bool, str, str]] = []
+
+    for msg in messages:  # newest first
+        if last_processed_at:
+            ts = _parse_ts(msg["Timestamp"])
+            if ts <= _parse_ts(last_processed_at):
+                break  # hit something we've already processed
+
+        text       = msg.get("Text") or msg.get("DisplayText") or ""
+        media_type = msg.get("MediaType") or ""
+        new_messages.append((_parse_ts(msg["Timestamp"]), msg["FromMe"], text, media_type))
 
     if not new_messages:
-        logger.debug("process_inbound: no new messages for %s (last_seen_id=%s)", chat.jid, chat.last_seen_id)
         return
 
-    # Always advance the cursor so we don't re-process the same messages
-    # Find the first message with a non-None ID to use as cursor
-    for msg in messages:
-        msg_id = msg.get("id")
-        if msg_id is not None:
-            chat.last_seen_id = msg_id
-            logger.debug("process_inbound: set last_seen_id to %s for %s", msg_id, chat.jid)
-            break
+    # Sort chronologically (wacli returns newest first)
+    new_messages.sort(key=lambda x: x[0])
+    latest_ts = new_messages[-1][0]
+
+    # ── Separate inbound from manual outbound ─────────────────────────────────
+    new_inbound         = [(ts, text, mt) for ts, from_me, text, mt in new_messages if not from_me]
+    new_manual_outbound = [(ts, text)     for ts, from_me, text, mt in new_messages if from_me]
+
+    # ── Sync ALL new messages into history in chronological order ────────────
+    # Both manual outbound (role: assistant) and inbound (role: user) are written
+    # so the AI always sees a complete, accurate conversation when it takes over.
+    for ts, from_me, text, media_type in new_messages:
+        if from_me:
+            if text:
+                state["llm_history"].append({"role": "assistant", "content": text})
+                logger.info("[%s] Human sent (synced to history): %s", state["phone"], text)
+        else:
+            content = text if text else (f"[{media_type} message]" if media_type else "")
+            if content:
+                state["llm_history"].append({"role": "user", "content": content})
+                logger.info("[%s] Lead said (synced to history): %s", state["phone"], content)
+
+    # ── human_needed: sync only, no AI trigger ────────────────────────────────
+    if is_human_needed:
+        if new_messages:
+            state["last_processed_at"] = latest_ts.isoformat()
+            state_manager.save(state)
+        return
+
+    # ── Nothing inbound to reply to ───────────────────────────────────────────
+    if not new_inbound:
+        if new_messages:
+            state["last_processed_at"] = latest_ts.isoformat()
+            state_manager.save(state)
+        return
+
+    # ── Build combined inbound text for the AI ────────────────────────────────
+    parts = []
+    for _, text, media_type in new_inbound:
+        if text:
+            parts.append(text)
+        elif media_type:
+            # Non-text content — describe it so AI can decide to notify owner
+            parts.append(f"[{media_type} message]")
+
+    combined_text = " ".join(parts).strip()
+    if not combined_text:
+        logger.warning("[%s] New inbound messages had no extractable content", state["phone"])
+        state["last_processed_at"] = latest_ts.isoformat()
+        state_manager.save(state)
+        return
+
+    logger.info("[%s] They said: %s", state["phone"], combined_text)
+
+    # ── Run AI turn ───────────────────────────────────────────────────────────
+    try:
+        result = ai.run_turn(
+            jid=jid,
+            history=state["llm_history"],
+            business=state["business"],
+            user_message=combined_text,
+        )
+    except RuntimeError as exc:
+        logger.error("[%s] AI turn failed: %s", state["phone"], exc)
+        return
+
+    # ── Update and persist state ──────────────────────────────────────────────
+    state["llm_history"] = result["history"]
+
+    # Cursor set to NOW (not the lead's message timestamp) so that the AI's
+    # own outbound messages — which land in wacli with timestamps around now —
+    # are behind the cursor on the next poll and never re-synced as manual messages.
+    state["last_processed_at"] = datetime.now(timezone.utc).isoformat()
+
+    if result["owner_notified"]:
+        state["status"] = "human_needed"
+
+    state_manager.save(state)
+
+    if result["messages_sent"]:
+        logger.info("[%s] Sent %d message(s)", state["phone"], len(result["messages_sent"]))
     else:
-        # No message has an ID - unusual but handle it
-        logger.warning("No message with ID found for %s", chat.jid)
-        chat.last_seen_id = None
-
-    # Default fromMe to False — if the key is missing, assume it's inbound.
-    # wacli always sets fromMe=True explicitly on outbound messages.
-    inbound = [m for m in new_messages if not m.get("fromMe", False)]
-
-    logger.debug("process_inbound: %d new messages, %d inbound for %s", len(new_messages), len(inbound), chat.jid)
-    # Debug: log IDs of new messages
-    if new_messages:
-        ids = [msg.get("id") for msg in new_messages]
-        logger.debug("process_inbound: new message IDs: %s", ids[:5])  # First 5 IDs
-
-    if not inbound:
-        logger.debug("process_inbound: no inbound messages for %s, saving state", chat.jid)
-        state_store.save_one(chat)
-        return
-
-    logger.info(
-        "%d inbound from %s (jid: %s) — waiting %ds...",
-        len(inbound), chat.business["name"], chat.jid, config.WAIT_AFTER_REPLY_SECONDS,
-    )
-    if not dry_run:
-        time.sleep(config.WAIT_AFTER_REPLY_SECONDS)
-
-    latest_text = inbound[0].get("text") or inbound[0].get("body") or ""
-    chat.last_inbound_time = time.time()
-
-    decision, updated_history = get_decision(chat.business, chat.history, latest_text)
-    _apply_decision(chat, decision, trigger_text=latest_text, dry_run=dry_run)
-    chat.history = updated_history
-    state_store.save_one(chat)
+        logger.info("[%s] AI chose not to reply", state["phone"])
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Opening message ───────────────────────────────────────────────────────────
 
-def run(dry_run: bool = False) -> None:
-    whatsapp.start_sync()
-    logger.info("wacli sync started")
+def send_opening(state: dict) -> None:
+    """Send the opening message to a new lead and initialise their state cursor."""
+    logger.info("[%s] Sending opening message...", state["phone"])
 
     try:
-        while True:
-            all_chats = state_store.get_all()
-            opened    = [c for c in all_chats if c.opening_sent]
-            unopened  = [c for c in all_chats if not c.opening_sent]
+        result = ai.run_turn(
+            jid=state["jid"],
+            history=[],
+            business=state["business"],
+            user_message=None,  # signals opening turn
+        )
+    except RuntimeError as exc:
+        logger.error("[%s] Failed to generate opening: %s", state["phone"], exc)
+        return
 
-            # ── Follow-ups ────────────────────────────────────────────────────
-            # Runs across ALL opened chats, not just the current focus lead,
-            # because we might have moved on before the follow-up timer fired.
-            for chat in opened:
-                if needs_followup(chat):
-                    try:
-                        send_followup(chat, dry_run)
-                    except Exception as exc:
-                        logger.error("Follow-up failed for %s: %s", chat.jid, exc)
+    # Cursor is set to right now — safe, no wacli fetch, no race condition
+    state_manager.mark_opened(state)
 
-            # ── Advance the opening queue ─────────────────────────────────────
-            if unopened:
-                if not opened:
-                    try:
-                        send_opening(unopened[0], dry_run)
-                    except Exception as exc:
-                        logger.error("Opening failed for %s: %s", unopened[0].jid, exc)
+    # Persist whatever the AI sent as the start of history
+    state["llm_history"] = result["history"]
+    state_manager.save(state)
 
-                elif ready_to_move_on(opened[-1]):
-                    logger.info(
-                        "%s is done — moving on to %s",
-                        opened[-1].business["name"], unopened[0].business["name"],
-                    )
-                    try:
-                        send_opening(unopened[0], dry_run)
-                    except Exception as exc:
-                        logger.error("Opening failed for %s: %s", unopened[0].jid, exc)
-
-                else:
-                    last = opened[-1]
-                    if last.last_inbound_time:
-                        remaining = config.MOVE_ON_REPLIED_HOURS * 3600 - (time.time() - last.last_inbound_time)
-                    else:
-                        remaining = config.MOVE_ON_NO_REPLY_HOURS * 3600 - (time.time() - (last.opening_sent_time or time.time()))
-                    logger.debug(
-                        "Waiting on %s — %.0fm until next opening",
-                        last.business["name"], remaining / 60,
-                    )
-
-            # ── Poll ALL opened chats for inbound replies ─────────────────────
-            # Includes chats we've "moved on" from — they can still reply.
-            for chat in opened:
-                try:
-                    process_inbound(chat, dry_run)
-                except Exception as exc:
-                    logger.error("Inbound error for %s: %s", chat.jid, exc)
-
-            time.sleep(config.POLL_INTERVAL_SECONDS)
-
-    except KeyboardInterrupt:
-        logger.info("Interrupted — shutting down")
-    finally:
-        whatsapp.stop_sync()
+    logger.info("[%s] Opening sent", state["phone"])
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    whatsapp.start_sync()
+    logger.info("Sync started")
+
+    leads = load_leads(CSV_PATH)
+    logger.info("Loaded %d lead(s) from %s", len(leads), CSV_PATH)
+
+    # ── Initialise new leads and send openings ────────────────────────────────
+    active_states: list[dict] = []
+
+    for lead in leads:
+        phone    = lead["phone"]
+        business = lead["business"]
+
+        existing = state_manager.load(phone)
+
+        if existing is None:
+            # Brand new lead — create state and send opening
+            state = state_manager.create(phone, business)
+            send_opening(state)
+            active_states.append(state)
+        else:
+            # Already known — just load and keep polling
+            active_states.append(existing)
+            logger.info("[%s] Resuming existing conversation (status: %s)", phone, existing.get("status"))
+
+    if not active_states:
+        logger.warning("No leads to process. Check %s", CSV_PATH)
+        return
+
+    # ── Poll loop ─────────────────────────────────────────────────────────────
+    logger.info("Starting poll loop for %d lead(s)...", len(active_states))
+    while True:
+        for state in active_states:
+            try:
+                process_lead(state)
+            except Exception as exc:
+                # Never let one bad lead crash the whole loop
+                logger.exception("[%s] Unexpected error: %s", state["phone"], exc)
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    if args.csv:
-        config.LEADS_CSV = args.csv
-
-    if args.dry_run:
-        logger.info("DRY-RUN mode")
-
-    leads = load_leads()
-    if not leads:
-        logger.error("No leads found.")
-        sys.exit(1)
-
-    logger.info("Loaded %d lead(s)", len(leads))
-    state_store.load(leads)
-    run(dry_run=args.dry_run)
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, stopping sync...")
+        whatsapp.stop_sync()
+    except Exception:
+        logger.exception("Fatal error")
+        whatsapp.stop_sync()
+        raise
