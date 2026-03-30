@@ -37,6 +37,8 @@ def create(phone: str, business: dict) -> dict:
         "status": "pending",
         "campaign_start_at": None,
         "last_processed_at": None,
+        "last_inbound_at": None,    # updated whenever the lead sends a message
+        "followup_count": 0,        # how many follow-ups have been sent so far
         "llm_history": [],
     }
     save(state)
@@ -47,11 +49,13 @@ def mark_opened(state: dict) -> dict:
     """
     Called immediately after sending the opening message.
     Sets campaign_start_at and last_processed_at to right now (local Python clock).
+    last_inbound_at is also set to now so the follow-up timer starts from this moment.
     No wacli fetch needed — no race condition possible.
     """
     now = datetime.now(timezone.utc).isoformat()
     state["campaign_start_at"] = now
     state["last_processed_at"] = now
+    state["last_inbound_at"]   = now   # follow-up clock starts from campaign open
     state["status"] = "active"
     save(state)
     return state

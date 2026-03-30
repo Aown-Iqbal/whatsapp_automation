@@ -8,6 +8,8 @@ import state as state_manager
 import whatsapp
 from config import (
     CSV_PATH,
+    FOLLOWUP_WAIT_HOURS,
+    MAX_FOLLOWUPS,
     POLL_INTERVAL_SECONDS,
     WAIT_AFTER_REPLY_SECONDS,
 )
@@ -51,8 +53,78 @@ def load_leads(path: str) -> list[dict]:
 
 def _parse_ts(ts_str: str) -> datetime:
     """Parse wacli's ISO 8601 UTC timestamp string into a timezone-aware datetime."""
-    # wacli returns e.g. "2026-03-28T08:46:58Z" — replace Z for Python compat
     return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+# ── Follow-up scheduler ───────────────────────────────────────────────────────
+
+def _maybe_send_followup(state: dict) -> None:
+    """
+    Called when the poll loop finds nothing new for a lead.
+    Sends an AI-generated follow-up if:
+      - lead is still active (not human_needed or converted)
+      - follow-up cap hasn't been reached
+      - enough time has passed since last_inbound_at
+    """
+    if state.get("status") != "active":
+        return
+
+    followup_count = state.get("followup_count", 0)
+    if followup_count >= MAX_FOLLOWUPS:
+        return
+
+    # Use last_inbound_at as the silence clock; fall back to campaign_start_at
+    # for leads who never replied at all (last_inbound_at set to campaign open time).
+    reference_ts = state.get("last_inbound_at") or state.get("campaign_start_at")
+    if not reference_ts:
+        return
+
+    elapsed_hours = (
+        datetime.now(timezone.utc) - _parse_ts(reference_ts)
+    ).total_seconds() / 3600
+
+    if elapsed_hours < FOLLOWUP_WAIT_HOURS:
+        return
+
+    logger.info(
+        "[%s] Follow-up #%d due (%.1fh of silence)",
+        state["phone"], followup_count + 1, elapsed_hours,
+    )
+
+    # Transient trigger — not persisted to history as a user message.
+    # Tells the AI to try a fresh angle without repeating itself.
+    trigger = (
+        "Lead ne abhi tak reply nahi di. "
+        "Ek gentle follow-up bhejo — naya angle try karo, "
+        "same cheez repeat mat karo."
+    )
+
+    try:
+        result = ai.run_turn(
+            jid=state["jid"],
+            history=state["llm_history"],
+            business=state["business"],
+            user_message=trigger,
+        )
+    except RuntimeError as exc:
+        logger.error("[%s] Follow-up AI turn failed: %s", state["phone"], exc)
+        return
+
+    state["llm_history"]      = result["history"]
+    state["followup_count"]   = followup_count + 1
+    state["last_processed_at"] = datetime.now(timezone.utc).isoformat()
+
+    if result["owner_notified"]:
+        state["status"] = "human_needed"
+
+    state_manager.save(state)
+
+    if result["messages_sent"]:
+        logger.info(
+            "[%s] Follow-up #%d sent (%d message(s))",
+            state["phone"], state["followup_count"], len(result["messages_sent"]),
+        )
+    else:
+        logger.warning("[%s] Follow-up AI turn produced no messages", state["phone"])
 
 
 # ── Per-lead processing ───────────────────────────────────────────────────────
@@ -89,7 +161,9 @@ def process_lead(state: dict) -> None:
             state["phone"], latest_ts.isoformat(), cursor_ts.isoformat(), messages[0]["FromMe"],
         )
         if latest_ts <= cursor_ts:
-            return  # nothing new
+            # Nothing new — check if a follow-up is due instead
+            _maybe_send_followup(state)
+            return
 
     # ── If the newest message is inbound, wait for them to finish typing ──────
     if not messages[0]["FromMe"]:
@@ -103,14 +177,13 @@ def process_lead(state: dict) -> None:
             return
 
     # ── Collect ALL new messages since the cursor (inbound + manual outbound) ─
-    # (timestamp, from_me, text, media_type)
     new_messages: list[tuple[datetime, bool, str, str]] = []
 
     for msg in messages:  # newest first
         if last_processed_at:
             ts = _parse_ts(msg["Timestamp"])
             if ts <= _parse_ts(last_processed_at):
-                break  # hit something we've already processed
+                break
 
         text       = msg.get("Text") or msg.get("DisplayText") or ""
         media_type = msg.get("MediaType") or ""
@@ -127,9 +200,13 @@ def process_lead(state: dict) -> None:
     new_inbound         = [(ts, text, mt) for ts, from_me, text, mt in new_messages if not from_me]
     new_manual_outbound = [(ts, text)     for ts, from_me, text, mt in new_messages if from_me]
 
+    # ── Track when the lead last spoke ───────────────────────────────────────
+    # This is what the follow-up timer runs against — not last_processed_at,
+    # which moves every time the AI sends something.
+    if new_inbound:
+        state["last_inbound_at"] = new_inbound[-1][0].isoformat()
+
     # ── Sync ALL new messages into history in chronological order ────────────
-    # Both manual outbound (role: assistant) and inbound (role: user) are written
-    # so the AI always sees a complete, accurate conversation when it takes over.
     for ts, from_me, text, media_type in new_messages:
         if from_me:
             if text:
@@ -161,7 +238,6 @@ def process_lead(state: dict) -> None:
         if text:
             parts.append(text)
         elif media_type:
-            # Non-text content — describe it so AI can decide to notify owner
             parts.append(f"[{media_type} message]")
 
     combined_text = " ".join(parts).strip()
@@ -188,9 +264,8 @@ def process_lead(state: dict) -> None:
     # ── Update and persist state ──────────────────────────────────────────────
     state["llm_history"] = result["history"]
 
-    # Cursor set to NOW (not the lead's message timestamp) so that the AI's
-    # own outbound messages — which land in wacli with timestamps around now —
-    # are behind the cursor on the next poll and never re-synced as manual messages.
+    # Cursor set to NOW so the AI's own outbound messages are behind it on
+    # the next poll and never re-synced as manual messages.
     state["last_processed_at"] = datetime.now(timezone.utc).isoformat()
 
     if result["owner_notified"]:
@@ -221,10 +296,11 @@ def send_opening(state: dict) -> None:
         logger.error("[%s] Failed to generate opening: %s", state["phone"], exc)
         return
 
-    # Cursor is set to right now — safe, no wacli fetch, no race condition
+    # Cursor set to right now — safe, no wacli fetch, no race condition.
+    # mark_opened also sets last_inbound_at to now so the follow-up clock
+    # starts from the moment we first reached out.
     state_manager.mark_opened(state)
 
-    # Persist whatever the AI sent as the start of history
     state["llm_history"] = result["history"]
     state_manager.save(state)
 
@@ -250,12 +326,10 @@ def main() -> None:
         existing = state_manager.load(phone)
 
         if existing is None:
-            # Brand new lead — create state and send opening
             state = state_manager.create(phone, business)
             send_opening(state)
             active_states.append(state)
         else:
-            # Already known — just load and keep polling
             active_states.append(existing)
             logger.info("[%s] Resuming existing conversation (status: %s)", phone, existing.get("status"))
 
@@ -270,7 +344,6 @@ def main() -> None:
             try:
                 process_lead(state)
             except Exception as exc:
-                # Never let one bad lead crash the whole loop
                 logger.exception("[%s] Unexpected error: %s", state["phone"], exc)
 
         time.sleep(POLL_INTERVAL_SECONDS)
