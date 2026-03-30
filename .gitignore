@@ -1,3 +1,4 @@
 /.env
 /chat_states.json
 states/
+__pycache__/
