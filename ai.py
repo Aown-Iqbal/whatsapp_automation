@@ -16,6 +16,17 @@ from prompt import build_system_prompt
 
 logger = logging.getLogger(__name__)
 
+
+# ── Typing delay ──────────────────────────────────────────────────────────────
+
+def _typing_delay(text: str) -> float:
+    """
+    Return a realistic delay in seconds based on message length.
+    Assumes ~200 characters per minute typing speed, clamped to [2, 12] seconds.
+    """
+    return max(2.0, min(len(text) / 200 * 60, 12.0))
+
+
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
 TOOLS = [
@@ -178,6 +189,7 @@ def run_turn(
                     whatsapp.send_message(jid, text)
                     messages_sent.append(text)
                     result_content = "sent"
+                    time.sleep(_typing_delay(text))
                 except RuntimeError as exc:
                     logger.error("send_message failed: %s", exc)
                     result_content = f"error: {exc}"
