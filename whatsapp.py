@@ -2,6 +2,7 @@ import json
 import logging
 import subprocess
 import time
+from subprocess import TimeoutExpired
 
 from config import WACLI
 
@@ -43,12 +44,15 @@ def get_messages(jid: str, limit: int = 20) -> list[dict]:
     Returns a list of message dicts ordered newest first.
     Raises RuntimeError on failure.
     """
-    result = subprocess.run(
-        [WACLI, "messages", "list", "--chat", jid, "--limit", str(limit), "--json"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    try:
+        result = subprocess.run(
+            [WACLI, "messages", "list", "--chat", jid, "--limit", str(limit), "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except TimeoutExpired:
+        raise RuntimeError(f"wacli messages list timed out for {jid}")
 
     if result.returncode != 0:
         raise RuntimeError(
@@ -70,12 +74,15 @@ def send_message(jid: str, text: str) -> None:
     No ||| splitting — the AI calls this tool once per message it wants to send.
     Raises RuntimeError on failure.
     """
-    result = subprocess.run(
-        [WACLI, "send", "text", "--to", jid, "--message", text],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    try:
+        result = subprocess.run(
+            [WACLI, "send", "text", "--to", jid, "--message", text],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except TimeoutExpired:
+        raise RuntimeError(f"wacli send timed out for {jid}")
 
     if result.returncode != 0:
         raise RuntimeError(
