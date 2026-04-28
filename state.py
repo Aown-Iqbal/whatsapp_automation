@@ -7,6 +7,8 @@ from config import STATE_DIR
 
 logger = logging.getLogger(__name__)
 
+TERMINAL_STATUSES = {"ghosted", "converted", "not_interested"}
+
 
 def _path(phone: str) -> Path:
     d = Path(STATE_DIR)
@@ -47,11 +49,41 @@ def mark_opened(state: dict) -> dict:
     """
     Called immediately after sending the opening message.
     Sets campaign_start_at and last_processed_at to right now (local Python clock).
-    No wacli fetch needed — no race condition possible.
     """
     now = datetime.now(timezone.utc).isoformat()
     state["campaign_start_at"] = now
     state["last_processed_at"] = now
     state["status"] = "active"
     save(state)
+    return state
+
+
+def mark_terminal(state: dict, status: str) -> dict:
+    """
+    Mark a lead as terminal (ghosted, converted, or not_interested).
+    Terminal leads are skipped by the poll loop and free up no slot —
+    they just stop being processed.
+    """
+    if status not in TERMINAL_STATUSES:
+        raise ValueError(f"Unknown terminal status: {status!r}")
+    state["status"] = status
+    state["terminal_at"] = datetime.now(timezone.utc).isoformat()
+    save(state)
+    logger.info("[%s] Marked as %s", state["phone"], status)
+    return state
+
+
+def mark_paused(state: dict) -> dict:
+    """Pause a lead — the poll loop will skip it but it is not terminal."""
+    state["status"] = "paused"
+    save(state)
+    logger.info("[%s] Paused", state["phone"])
+    return state
+
+
+def mark_resumed(state: dict) -> dict:
+    """Resume a paused lead back to active."""
+    state["status"] = "active"
+    save(state)
+    logger.info("[%s] Resumed", state["phone"])
     return state
