@@ -123,8 +123,8 @@ def extract_panel(page) -> dict:
 
 def scrape_maps(query: str) -> list[dict]:
     results: list[dict] = []
-    seen_articles: set[str] = set()   # dedup by article aria-label during scraping
-    seen_phones: set[str]   = set()   # dedup by phone at save time
+    seen_articles: set[str] = set()
+    seen_phones: set[str] = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -145,7 +145,6 @@ def scrape_maps(query: str) -> list[dict]:
         print(f"Navigating to: {url}")
         page.goto(url, wait_until="domcontentloaded")
 
-        # Wait for the results feed
         page.wait_for_selector('div[role="feed"]', timeout=15000)
         feed = page.locator('div[role="feed"]')
 
@@ -165,8 +164,26 @@ def scrape_maps(query: str) -> list[dict]:
                     continue
                 seen_articles.add(aria)
 
+                # Record the currently open panel name before clicking
+                current_panel = page.locator('div[aria-label^="Information for "]').first
+                current_panel_label = ""
+                if current_panel.count():
+                    current_panel_label = current_panel.get_attribute("aria-label") or ""
+
                 try:
                     article.click()
+
+                    # Wait until the panel changes to a new one, not the previous
+                    if current_panel_label:
+                        page.wait_for_function(
+                            """(prevLabel) => {
+                                const panel = document.querySelector('div[aria-label^="Information for "]');
+                                return panel && panel.getAttribute('aria-label') !== prevLabel;
+                            }""",
+                            arg=current_panel_label,
+                            timeout=PANEL_TIMEOUT_MS,
+                        )
+                    
                     page.wait_for_timeout(BETWEEN_CLICKS_MS)
                     data = extract_panel(page)
                 except PlaywrightTimeout:
@@ -179,7 +196,6 @@ def scrape_maps(query: str) -> list[dict]:
                 if not data["name"]:
                     continue
 
-                # Deduplicate by phone number (fall back to name if no phone)
                 phone_key = data["phone"] or data["name"]
                 if phone_key in seen_phones:
                     print(f"  Skipping duplicate: {data['name']}")
