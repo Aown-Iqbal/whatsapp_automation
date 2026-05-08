@@ -1,4 +1,7 @@
 /.env
 /chat_states.json
-states/
-__pycache__/
+/states/
+/__pycache__/
+/pending_replies.json
+/campaign.json
+/daemon.pid

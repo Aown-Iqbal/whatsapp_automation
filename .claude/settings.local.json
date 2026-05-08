@@ -1,13 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m py_compile scraping/common.py)",
-      "Bash(python -m py_compile scraping/social_scraper.py)",
-      "Bash(python -m py_compile scraping/ad_checker.py)",
-      "Bash(python -c \"import sys; sys.path.insert\\(0, 'scraping'\\); from common import is_valid_facebook_page_url, clean_name, launch_browser; print\\('Import test passed'\\); print\\(clean_name\\('Test Biz \\(Branch\\)'\\)\\)\")",
-      "Bash(python -c \"import sys; sys.path.insert\\(0, 'scraping'\\); from social_scraper import scrape_facebook_contacts, find_facebook_on_website; from ad_checker import get_ad_counts, has_no_ads; print\\('All imports OK'\\)\")",
+      "Bash(wacli send text --to *)",
+      "Bash(wacli messages list --chat *)",
+      "Bash(wacli sync *)",
+      "Bash(python daemon.py *)",
+      "Bash(python scraping/*)",
+      "Bash(python -c *)",
+      "Bash(python -m *)",
       "Bash(pip show *)",
-      "Bash(pip3 show *)"
+      "Bash(pip3 show *)",
+      "Bash(rm -rf __pycache__)",
+      "Bash(rm -rf scraping/__pycache__)"
     ]
   }
 }

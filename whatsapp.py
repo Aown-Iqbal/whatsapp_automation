@@ -1,42 +1,12 @@
 import json
 import logging
 import subprocess
-import time
 from subprocess import TimeoutExpired
-
-from config import WACLI
 
 logger = logging.getLogger(__name__)
 
-_sync_process: subprocess.Popen | None = None
+WACLI = "wacli"
 
-
-# ── Sync process management ───────────────────────────────────────────────────
-
-def start_sync() -> None:
-    """Start the wacli sync --follow --ipc background process."""
-    global _sync_process
-    if _sync_process and _sync_process.poll() is None:
-        return  # already running
-    logger.debug("Starting wacli sync")
-    _sync_process = subprocess.Popen(
-        [WACLI, "sync", "--follow", "--ipc"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def stop_sync() -> None:
-    """Stop the wacli sync background process (called on shutdown only)."""
-    global _sync_process
-    if _sync_process and _sync_process.poll() is None:
-        logger.debug("Stopping wacli sync")
-        _sync_process.terminate()
-        _sync_process.wait()
-    _sync_process = None
-
-
-# ── Message retrieval ─────────────────────────────────────────────────────────
 
 def get_messages(jid: str, limit: int = 20) -> list[dict]:
     """
@@ -66,12 +36,9 @@ def get_messages(jid: str, limit: int = 20) -> list[dict]:
         raise RuntimeError(f"Unexpected wacli output: {result.stdout[:200]}") from exc
 
 
-# ── Sending ───────────────────────────────────────────────────────────────────
-
 def send_message(jid: str, text: str) -> None:
     """
     Send a single message to a JID.
-    No ||| splitting — the AI calls this tool once per message it wants to send.
     Raises RuntimeError on failure.
     """
     try:
