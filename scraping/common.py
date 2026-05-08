@@ -3,7 +3,6 @@ import sys
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CITY        = "Faisalabad"
 PROFILE_DIR = r"C:\Git Gud\chrome_profile"
 
 USER_AGENT = (

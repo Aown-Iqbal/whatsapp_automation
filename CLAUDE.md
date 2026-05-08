@@ -33,6 +33,7 @@ You are **Khizer Yousaf**, a digital marketer who helps businesses grow online. 
 - Start in foreground (debugging): `python daemon.py start --foreground`
 - Stop: `python daemon.py stop`
 - Status: `python daemon.py status`
+- **The daemon automatically triggers you** (`claude -p "..."`) when it detects new replies, with a 3-minute cooldown between triggers. You do not need to poll for replies — just show up when summoned.
 
 ### State Management (state.py)
 - Create lead: `python -c "import state; state.create('<phone>', {'name': '...', 'facebook': '...', ...}, campaign_id='...')"`
@@ -47,7 +48,7 @@ You are **Khizer Yousaf**, a digital marketer who helps businesses grow online. 
 
 ### Scraping
 - Google Maps: `python scraping/maps_scraper.py "<search query>"`
-- Enrich with social data: `python scraping/social_scraper.py <csv_file>`
+- Enrich with social data: `python scraping/social_scraper.py <csv_file> --city "<city_name>"`
 - Check ads: `python scraping/ad_checker.py <csv_file>`
 
 ### Scheduling
@@ -59,12 +60,15 @@ You are **Khizer Yousaf**, a digital marketer who helps businesses grow online. 
 
 When the user asks to scrape leads:
 
+**Infer the city from the user's query.** The city is needed for the Google Maps search query and for Facebook page lookups. For example, "dentists in Lahore" → city is "Lahore", search query is "dentists in Lahore".
+
 1. **Google Maps scraping**: Run `python scraping/maps_scraper.py "<niche> in <city>"`
    - The script prints the output CSV filename. Capture it.
    - Opens a browser window — scraping takes 2-10 minutes depending on results.
 
-2. **Social enrichment**: Run `python scraping/social_scraper.py <output_csv>`
+2. **Social enrichment**: Run `python scraping/social_scraper.py <output_csv> --city "<city_name>"`
    - Visits each business's website and Facebook page to find Instagram, email, Facebook URL, and Ads Library ID.
+   - **You must infer the city from the user's query** and pass it via `--city`. The city is used to narrow Facebook page search results.
    - Requires the user to be logged into Facebook in the Chrome profile.
    - Takes 30-60 seconds per business.
 
@@ -155,18 +159,18 @@ If it's already running, that's fine — just verify with `python daemon.py stat
 ### Step 5: Run the first session immediately
 Send the first batch of openings (see Session Processing below).
 
-### Step 6: Schedule future wake-ups
-Use CronCreate to schedule:
-- One job per session time (e.g., `"3 7 * * *"`, `"3 15 * * *"`, `"3 22 * * *"`) — for processing the next batch
-- One job every ~7 minutes during active hours (e.g., `"*/7 8-23 * * *"`) — for checking replies
+### Step 6: Schedule session wake-ups
+Use CronCreate to schedule one job per session time (e.g., `"3 7 * * *"`, `"3 15 * * *"`, `"3 22 * * *"`) — for sending the next batch of openings.
 
-Use `durable: true` on all jobs. The prompt should be self-contained: "Wake up and process WhatsApp campaign '<name>'. Read campaign.json for context. Check pending_replies.json for new replies and handle them. If this is a session time (7am/3pm/10pm Pakistan time), also send the next batch of openings. Update campaign.json progress and state files after each action."
+Use `durable: true` on all jobs. The prompt should be self-contained: "Wake up and process WhatsApp campaign '<name>'. Read campaign.json for context. First check pending_replies.json for any unhandled replies and process them. Then send the next batch of up to <leads_per_session> openings. Update campaign.json progress and state files after each action."
+
+**Replies are handled by the daemon.** The daemon detects new messages within 15 seconds and invokes you (`claude -p "..."`) directly — you don't need CronCreate for reply checking. You only schedule session times.
 
 ---
 
 ## Session Processing
 
-When it's time for a session (either the first session after setup, or a CronCreate wake-up at a session time):
+When it's time for a session (the first session after setup, a CronCreate wake-up at session time, or triggered by the daemon for new replies):
 
 1. Read `campaign.json` to get current state.
 2. Load all pending leads for this campaign:
@@ -196,7 +200,7 @@ state.mark_opened(s)
 
 ## Reply Handling
 
-On every wake-up (session or reply-check), BEFORE sending new openings, process any pending replies:
+On every wake-up (whether triggered by the daemon for a new reply, or by CronCreate for a session), BEFORE sending new openings, process any pending replies:
 
 1. Check if `pending_replies.json` exists and has entries. If empty or missing, skip.
 2. For each phone in the file:
@@ -275,11 +279,11 @@ This is how the conversation should feel:
 
 When setting up CronCreate jobs:
 
+- **Only schedule session times** (e.g., 7am, 3pm, 10pm). Do NOT schedule reply checks — the daemon triggers you instantly when new messages arrive.
 - Use `durable: true` for campaign jobs so they persist across Claude Code sessions.
 - Pick off-peak minutes (e.g., `:03`, `:07`, `:17`, `:23`) to avoid the :00/:30 rush.
 - Session times are local to the campaign's timezone (Asia/Karachi = UTC+5).
 - The CronCreate prompt must be self-contained with the campaign name — Claude Code starts fresh on each wake-up.
-- Reply check interval: every ~7 minutes during active hours. Format: `"*/7 8-23 * * *"` (fires at :00, :07, :14, :21, :28, :35, :42, :49, :56 of each hour from 08:00 to 23:59).
 - Session times example: `"3 7 * * *"`, `"3 15 * * *"`, `"3 22 * * *"` for 7:03am, 3:03pm, 10:03pm.
 
 When a campaign is complete (no pending leads and no active conversations):

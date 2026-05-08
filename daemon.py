@@ -31,8 +31,11 @@ PID_FILE = "daemon.pid"
 PENDING_FILE = "pending_replies.json"
 STATE_DIR = os.environ.get("STATE_DIR", "states")
 POLL_INTERVAL = 15  # seconds between reply checks
+TRIGGER_COOLDOWN = 180  # minimum seconds between Claude Code triggers
 # wacli only works inside WSL, so prefix with 'wsl' when running on Windows
 WACLI = ["wsl", "wacli"] if sys.platform == "win32" else ["wacli"]
+# Claude CLI — also needs wsl on Windows
+CLAUDE_CLI = ["wsl", "claude"] if sys.platform == "win32" else ["claude"]
 
 
 # ── PID file helpers ─────────────────────────────────────────────────────────
@@ -183,10 +186,33 @@ def write_pending(pending: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def trigger_claude(pending: dict) -> None:
+    """Fire-and-forget invocation of Claude Code to process pending replies."""
+    chat_list = ", ".join(
+        f"{p['phone']} ({p['new_count']} new)" for p in pending.values()
+    )
+    prompt = (
+        f"Process pending WhatsApp replies. "
+        f"Read pending_replies.json, decide responses to each lead, "
+        f"send replies via wsl wacli, update state files, then clear pending_replies.json. "
+        f"Chats with new messages: {chat_list}"
+    )
+    logger.info("Triggering Claude Code for %d chat(s)", len(pending))
+    try:
+        subprocess.Popen(
+            CLAUDE_CLI + ["-p", prompt],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        logger.error("Failed to trigger Claude Code: %s", exc)
+
+
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 _sync_proc: subprocess.Popen | None = None
 _shutdown: bool = False
+_last_trigger_time: float = 0
 
 
 def handle_signal(signum, frame):
@@ -196,7 +222,7 @@ def handle_signal(signum, frame):
 
 
 def run_foreground():
-    global _sync_proc, _shutdown
+    global _sync_proc, _shutdown, _last_trigger_time
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
@@ -219,6 +245,14 @@ def run_foreground():
                 count = sum(p["new_count"] for p in pending.values())
                 logger.info("Found %d new message(s) across %d chat(s)", count, len(pending))
                 write_pending(pending)
+                # Trigger Claude Code immediately (with cooldown to avoid spam)
+                now = time.time()
+                if now - _last_trigger_time >= TRIGGER_COOLDOWN:
+                    trigger_claude(pending)
+                    _last_trigger_time = now
+                else:
+                    logger.info("Skipping trigger (cooldown, next in %.0fs)",
+                                TRIGGER_COOLDOWN - (now - _last_trigger_time))
         except Exception as exc:
             logger.error("Reply check failed: %s", exc)
 

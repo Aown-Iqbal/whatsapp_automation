@@ -9,7 +9,7 @@ import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 from common import (
-    CITY, is_valid_facebook_page_url, is_real_website, clean_name,
+    is_valid_facebook_page_url, is_real_website, clean_name,
     SOCIAL_DOMAINS, launch_browser, ensure_logged_in,
 )
 
@@ -76,9 +76,9 @@ def scrape_website_contacts(website: str, page) -> dict:
 
 # ── Facebook page finding ─────────────────────────────────────────────────────
 
-def find_facebook_via_search(name: str, page) -> str | None:
+def find_facebook_via_search(name: str, city: str, page) -> str | None:
     """Search Facebook's pages directory for the business."""
-    query = f"{clean_name(name)} {CITY}".replace(" ", "%20")
+    query = f"{clean_name(name)} {city}".replace(" ", "%20")
     url = f"https://www.facebook.com/search/pages/?q={query}"
 
     try:
@@ -285,11 +285,17 @@ def _has_value(val) -> bool:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python social_scraper.py <csv_file_path>")
+    if len(sys.argv) < 3:
+        print("Usage: python social_scraper.py <csv_file_path> --city <city_name>")
         sys.exit(1)
 
     csv_path = sys.argv[1]
+
+    city = "Faisalabad"  # default
+    for i, arg in enumerate(sys.argv):
+        if arg == "--city" and i + 1 < len(sys.argv):
+            city = sys.argv[i + 1]
+            break
     if not os.path.exists(csv_path):
         print(f"Error: CSV file '{csv_path}' not found.")
         sys.exit(1)
@@ -366,7 +372,7 @@ def main():
 
             if not facebook_url:
                 print(f"  Searching Facebook for page...")
-                facebook_url = find_facebook_via_search(name, page) or ""
+                facebook_url = find_facebook_via_search(name, city, page) or ""
                 if facebook_url:
                     print(f"  Found via FB search: {facebook_url}")
 
