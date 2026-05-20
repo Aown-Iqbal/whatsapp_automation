@@ -121,7 +121,7 @@ def extract_panel(page) -> dict:
 
 # ── Main scraper ──────────────────────────────────────────────────────────────
 
-def scrape_maps(query: str) -> list[dict]:
+def scrape_maps(query: str, max_results: int = 0) -> list[dict]:
     results: list[dict] = []
     seen_articles: set[str] = set()
     seen_phones: set[str] = set()
@@ -206,6 +206,13 @@ def scrape_maps(query: str) -> list[dict]:
                 new_this_round += 1
                 print(f"  [{len(results)}] {data['name']} | {data['phone']} | {data['address'][:40]}")
 
+                if max_results > 0 and len(results) >= max_results:
+                    print(f"Reached max results limit ({max_results}) — stopping.")
+                    break
+
+            if max_results > 0 and len(results) >= max_results:
+                break
+
             if new_this_round == 0:
                 scroll_retries += 1
                 print(f"No new articles (retry {scroll_retries}/{MAX_SCROLL_RETRIES}), scrolling...")
@@ -244,14 +251,22 @@ def save_csv(rows: list[dict], query: str) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python maps_scraper.py <search query>")
-        print('Example: python maps_scraper.py "electronics shops in lahore"')
+        print("Usage: python maps_scraper.py <search query> [--max N]")
+        print('Example: python maps_scraper.py "electronics shops in lahore" --max 10')
         sys.exit(1)
 
-    query = " ".join(sys.argv[1:])
-    print(f'Scraping: "{query}"')
+    max_results = 0
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--max" and i + 1 < len(args):
+            max_results = int(args[i + 1])
+            del args[i:i+2]
+            break
 
-    data = scrape_maps(query)
+    query = " ".join(args)
+    print(f'Scraping: "{query}"' + (f" (max {max_results})" if max_results > 0 else ""))
+
+    data = scrape_maps(query, max_results=max_results)
     if data:
         save_csv(data, query)
     else:

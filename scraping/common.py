@@ -86,12 +86,17 @@ def launch_browser(playwright):
 
 
 def ensure_logged_in(page):
-    """Check Facebook login status. Prompt user to log in if needed."""
+    """Check Facebook login status. Prompt user to log in if running interactively."""
     print("Checking Facebook login status...")
     page.goto("https://www.facebook.com", wait_until="domcontentloaded", timeout=15000)
     page.wait_for_timeout(2000)
 
     if page.locator('input[name="email"]').count() > 0:
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "Not logged into Facebook and running in non-interactive mode. "
+                "Run the script manually in a terminal to log in first."
+            )
         print("\n⚠ Not logged into Facebook.")
         print("Please log in manually in the browser window, then press Enter here to continue...")
         input()

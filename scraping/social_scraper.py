@@ -29,9 +29,9 @@ def scrape_website_contacts(website: str, page) -> dict:
         website = "https://" + website
 
     try:
-        page.goto(website, wait_until="load", timeout=FB_PAGE_TIMEOUT)
+        page.goto(website, wait_until="domcontentloaded", timeout=FB_PAGE_TIMEOUT)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(500)
 
         for a in page.locator("a").all():
             href = (a.get_attribute("href") or "").strip()
@@ -86,7 +86,7 @@ def find_facebook_via_search(name: str, city: str, page) -> str | None:
         page.goto(url, wait_until="load", timeout=FB_PAGE_TIMEOUT)
         # Wait for search results to actually render (slow connections need more time)
         page.wait_for_selector('div[role="article"]', timeout=20000)
-        page.wait_for_timeout(1000)  # let any late renders settle
+        page.wait_for_timeout(300)  # let any late renders settle
 
         for article in page.locator('div[role="article"]').all():
             for a in article.locator("a[href*='facebook.com']").all():
@@ -129,30 +129,38 @@ def scrape_facebook_contacts(facebook_url: str, page) -> dict:
         print(f"    Loading Facebook page...")
         page.goto(facebook_url, wait_until="load", timeout=FB_PAGE_TIMEOUT)
 
-        # Gently scroll to trigger lazy-loading of About sections (Links,
-        # Contact info, Details) that sit below the main feed.
-        for i in range(3):
-            page.evaluate("window.scrollBy(0, 600)")
-            page.wait_for_timeout(1200)
+        # Scroll to trigger lazy-loading of About sections, then wait for
+        # the specific headings we need (exits the moment they appear).
+        page.evaluate("window.scrollBy(0, 800)")
+        page.wait_for_timeout(400)
 
-        # Wait for lazy-loaded sections to render
-        loaded = False
-        for selector in ['div[role="list"]', 'div[role="main"]', 'div[role="article"]']:
+        about_found = False
+        for _ in range(2):
             try:
-                page.wait_for_selector(selector, timeout=8000)
-                loaded = True
+                page.wait_for_selector(
+                    '//span[text()="Links"] | //span[text()="Contact info"] | //span[text()="Details"]',
+                    timeout=6000
+                )
+                about_found = True
                 break
             except PlaywrightTimeout:
-                continue
+                page.evaluate("window.scrollBy(0, 600)")
+                page.wait_for_timeout(400)
 
-        if not loaded:
-            try:
-                page.wait_for_selector("body", timeout=5000)
-            except PlaywrightTimeout:
-                pass
+        if not about_found:
+            # Fallback: wait for any main content
+            for selector in ['div[role="main"]', 'div[role="article"]']:
+                try:
+                    page.wait_for_selector(selector, timeout=5000)
+                    about_found = True
+                    break
+                except PlaywrightTimeout:
+                    continue
+
+        if not about_found:
             print("    Page content didn't load — continuing anyway")
 
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(500)
         html = page.content()
 
         # Extract numeric page ID from raw HTML
@@ -175,12 +183,6 @@ def scrape_facebook_contacts(facebook_url: str, page) -> dict:
                 '//div[@role="list" and @aria-labelledby='
                 '//h2[.//span[text()="Links"]]/span/@id]//a'
             ),
-            "phone": (
-                '//div[@role="list" and @aria-labelledby='
-                '//h2[.//span[text()="Contact info"]]/span/@id]'
-                '//div[@role="listitem"][.//img[contains(@src,"M3.12 1.465a2.5")]]'
-                '//span[@dir="auto"]'
-            ),
             "email": (
                 '//div[@role="list" and @aria-labelledby='
                 '//h2[.//span[text()="Contact info"]]/span/@id]'
@@ -197,7 +199,7 @@ def scrape_facebook_contacts(facebook_url: str, page) -> dict:
             try:
                 locator = page.locator(f"xpath={xpath}")
                 if locator.count() > 0:
-                    value = locator.first.inner_text() if field == "phone" else locator.first.get_attribute("href")
+                    value = locator.first.get_attribute("href")
                     if value:
                         value = value.strip()
                         if field == "email" and value.startswith("mailto:"):
@@ -209,6 +211,63 @@ def scrape_facebook_contacts(facebook_url: str, page) -> dict:
                             print(f"    Found {field}: {value}")
             except Exception as e:
                 print(f"    XPath failed for {field}: {e}")
+
+        # Phone: try multiple approaches since Facebook markup varies
+        phone_patterns = [
+            r'\+\d{1,3}\s?\d[\d\s\-\(\)]{6,}',  # +91 87002 98264
+            r'\d{3,5}\s\d[\d\s\-]{5,}',           # 0305 2999269
+            r'\+\d{10,15}',                         # +918700298264
+            r'\d{10,12}',                           # 03052999269
+        ]
+        try:
+            # Method 1: Find Contact info heading, then scan nearby spans
+            contact_heading = page.locator('//span[text()="Contact info"]')
+            if contact_heading.count() > 0:
+                # Walk up to a reasonable container (5 levels up)
+                container = contact_heading.first
+                for _ in range(6):
+                    container = container.locator("xpath=..")
+                section_text = container.first.inner_text()
+                for pat in phone_patterns:
+                    m = re.search(pat, section_text)
+                    if m:
+                        result["phone"] = m.group(0).strip()
+                        break
+        except Exception:
+            pass
+
+        if not result["phone"]:
+            # Method 2: Scan every span[dir="auto"] for phone-like content
+            try:
+                for span in page.locator('span[dir="auto"]').all():
+                    try:
+                        text = span.inner_text().strip()
+                        for pat in phone_patterns:
+                            m = re.match(pat, text)
+                            if m and len(text) < 25:
+                                result["phone"] = m.group(0).strip()
+                                break
+                        if result["phone"]:
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if not result["phone"]:
+            # Method 3: Full body regex fallback
+            try:
+                body_text = page.locator("body").inner_text()
+                for pat in phone_patterns:
+                    m = re.search(pat, body_text)
+                    if m:
+                        result["phone"] = m.group(0).strip()
+                        break
+            except Exception:
+                pass
+
+        if result["phone"]:
+            print(f"    Found phone: {result['phone']}")
 
         # Fallback: scan all nofollow links. Order matters — bing.com/maps links
         # from the Details section appear before the real website in Links, so we
@@ -310,7 +369,7 @@ def main():
         else:
             df[col] = df[col].fillna("").astype(str)
 
-    for col in ("email", "ads_library_id"):
+    for col in ("email", "ads_library_id", "phone"):
         if col not in df.columns:
             df[col] = ""
         else:
@@ -425,7 +484,7 @@ def main():
                         df.at[idx, "email"] = site_data["email"]
                         print(f"  Email from new website: {site_data['email']}")
 
-            time.sleep(random.uniform(1.5, 3.0))
+            time.sleep(random.uniform(0.5, 1.5))
             df.to_csv(csv_path, index=False)
 
         context.close()

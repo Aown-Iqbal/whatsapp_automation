@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test_phone.py)",
+      "Bash(python test_phone2.py)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

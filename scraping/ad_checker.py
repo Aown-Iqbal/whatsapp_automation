@@ -20,6 +20,7 @@ def get_ad_counts(page_id: str, page) -> dict | None:
     url = (
         f"https://www.facebook.com/ads/library/"
         f"?active_status=all&ad_type=all&country=ALL"
+        f"&is_targeted_country=false&media_type=all"
         f"&view_all_page_id={page_id}"
     )
     print(f"    Ad Library: {url}")
@@ -38,6 +39,7 @@ def get_ad_counts(page_id: str, page) -> dict | None:
             return None
 
         def collect_visible_ads() -> dict:
+            """Return {ad_id: is_active} for each visible ad card."""
             spans = page.locator('span:has-text("Library ID:")')
             ads = {}
             for i in range(spans.count()):
@@ -50,28 +52,24 @@ def get_ad_counts(page_id: str, page) -> dict | None:
                     'xpath=ancestor::div[contains(@class, "x1plvlek")]'
                 ).first
                 if container.count() > 0:
-                    ads[ad_id] = container
+                    ads[ad_id] = "Active" in container.text_content()
             return ads
 
         all_ads = collect_visible_ads()
         previous_count = 0
 
-        for attempt in range(10):
+        for attempt in range(6):
             if len(all_ads) == previous_count:
                 print(f"    No new ads after scroll {attempt}, stopping")
                 break
             previous_count = len(all_ads)
             print(f"    Scroll {attempt + 1}, ads so far: {len(all_ads)}")
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(1200)
             all_ads.update(collect_visible_ads())
 
         total = len(all_ads)
-        active = sum(
-            1 for container in all_ads.values()
-            if container.locator('span:has-text("Active")').first.count() > 0
-            and "Active" in container.locator('span:has-text("Active")').first.inner_text()
-        )
+        active = sum(1 for v in all_ads.values() if v)
 
         return {"total": total, "active": active}
 
@@ -93,7 +91,7 @@ def main():
         sys.exit(1)
 
     print(f"Processing: {csv_path}")
-    df = pd.read_csv(csv_path, dtype={"phone": str})
+    df = pd.read_csv(csv_path, dtype={"phone": str, "ads_library_id": str, "ads_library_url": str})
 
     # Ensure required columns exist
     for col in ("ads_library_id",):
@@ -134,7 +132,7 @@ def main():
             else:
                 print("  Ad Library scrape failed — leaving blank")
 
-            time.sleep(random.uniform(1.5, 3.0))
+            time.sleep(random.uniform(0.3, 0.8))
             df.to_csv(csv_path, index=False)
 
         context.close()
